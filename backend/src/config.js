@@ -52,10 +52,18 @@ export function loadConfig(env = process.env) {
   const allowedOrigins = frontendOrigin ? [frontendOrigin] : [];
   if (!isProduction && frontendOrigin.includes('localhost')) allowedOrigins.push(frontendOrigin.replace('localhost', '127.0.0.1'));
 
-  // Where templates, mapping, history and sessions are stored. On Render this is
-  // the persistent disk; the source directory is replaced on every deploy.
-  const dataDir = clean(env.DATA_DIR) || (isProduction ? '/var/data' : DEFAULT_DATA_DIR);
-  if (isProduction && !path.posix.isAbsolute(dataDir) && !path.isAbsolute(dataDir)) fatal.push('DATA_DIR must be an absolute path (e.g. /var/data).');
+  // Where templates, mapping, history and sessions are stored.
+  // - DATA_DIR set (e.g. a Render persistent disk at /var/data): that folder must exist.
+  // - DATA_DIR not set: backend/data inside the app. On this PC that folder is
+  //   permanent; on a host without a disk (e.g. Render Free) it is TEMPORARY and
+  //   is wiped on every restart, spin-down and redeploy.
+  const explicitDataDir = clean(env.DATA_DIR);
+  const dataDir = explicitDataDir || DEFAULT_DATA_DIR;
+  if (explicitDataDir && isProduction && !path.posix.isAbsolute(dataDir) && !path.isAbsolute(dataDir)) fatal.push('DATA_DIR must be an absolute path (e.g. /var/data).');
+  const persistentStorage = Boolean(explicitDataDir) || !isProduction;
+  const storageWarning = persistentStorage
+    ? null
+    : 'Temporary storage: sending history, the email template, the column mapping and sign-in sessions are lost whenever the server restarts, sleeps or is redeployed. Duplicate warnings only cover emails sent since the last restart.';
 
   // Host names this server answers to (besides localhost). Render's own
   // *.onrender.com host name is added automatically.
@@ -118,6 +126,9 @@ export function loadConfig(env = process.env) {
     allowedHosts,
     trustProxy,
     dataDir,
+    explicitDataDir: Boolean(explicitDataDir),
+    persistentStorage,
+    storageWarning,
     auth,
     fatal,
     smtp: { host, port: smtpPort, secure, user, pass, from },

@@ -57,7 +57,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     sweep.unref();
   }
   const envWhere = config.isProduction ? 'the Render environment variables' : 'backend/.env (see README)';
-  const historyFileLabel = config.isProduction ? path.posix.join(dataDir, 'sent-emails.xlsx') : 'backend/data/sent-emails.xlsx';
+  const historyFileLabel = config.isProduction && config.explicitDataDir ? path.posix.join(dataDir, 'sent-emails.xlsx') : 'backend/data/sent-emails.xlsx';
 
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy ?? false);
@@ -348,6 +348,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       problems: config.problems,
       warnings: config.warnings,
       hosted: Boolean(config.isProduction),
+      storageWarning: config.storageWarning || null,
       lastTest: lastSmtpTest,
     };
   }

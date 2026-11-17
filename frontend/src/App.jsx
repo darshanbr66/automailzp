@@ -176,6 +176,7 @@ function Workspace({ auth, onSignOut }) {
               : <>Edit <code>backend\.env</code> (see README, “Hostinger App Password”) and restart the app.</>}
           </Alert>
         )}
+        {smtp?.storageWarning && <Alert type="warning"><strong>Temporary storage.</strong> {smtp.storageWarning.replace(/^Temporary storage: /, '')}</Alert>}
         {smtp?.configured && smtp.warnings?.map((w) => <Alert key={w} type="warning">{w}</Alert>)}
         {banner && <Alert type={banner.type} onClose={() => setBanner(null)}>{banner.text}</Alert>}
         {!banner && smtp?.configured && smtp.lastTest && !smtp.lastTest.ok && (

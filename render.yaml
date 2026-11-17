@@ -1,6 +1,11 @@
 # Render Blueprint – ZodiacPatent Attorney Email Automation (backend API)
 #
-# One paid Web Service with a persistent disk mounted at /var/data.
+# One Web Service on the FREE plan, without a persistent disk.
+# Without a disk, history, templates, column mapping and sessions are stored in
+# the app folder and are LOST on every restart, sleep (Free instances spin down
+# when idle) and redeploy. See DEPLOYMENT.md, "Render Free: what is not kept".
+# To keep data later: switch to a paid plan, add a disk at /var/data and set
+# DATA_DIR=/var/data (do NOT set DATA_DIR without a disk: the server will refuse to start).
 # Secrets marked "sync: false" are NOT stored here: Render asks for them when the
 # Blueprint is first applied (or set them under Service → Environment).
 # See DEPLOYMENT.md for the full procedure.
@@ -8,25 +13,18 @@ services:
   - type: web
     name: zodiacpatent-api
     runtime: node
-    plan: starter            # paid instance type (persistent disks require a paid plan)
+    plan: free
     rootDir: backend
     buildCommand: npm ci --omit=dev
     startCommand: node src/server.js
     healthCheckPath: /healthz
     autoDeploy: false        # deploy manually from the Render dashboard; see DEPLOYMENT.md to enable auto-deploy
-    # A service with a disk always runs as ONE instance. Never scale this
-    # service out: the history workbook, locks and sessions assume a single process.
-    disk:
-      name: zodiacpatent-data
-      mountPath: /var/data
-      sizeGB: 1
+    # Run ONE instance only: the history workbook, locks and sessions assume a single process.
     envVars:
       - key: NODE_ENV
         value: production
       - key: NODE_VERSION
         value: "20"
-      - key: DATA_DIR
-        value: /var/data
       - key: FRONTEND_URL
         value: https://app.zodiacpatent.com
       - key: ALLOWED_HOSTS

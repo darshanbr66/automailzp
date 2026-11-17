@@ -7,7 +7,7 @@ import http from 'node:http';
 import path from 'node:path';
 import * as XLSX from 'xlsx';
 import { createApp } from '../src/app.js';
-import { loadConfig } from '../src/config.js';
+import { DEFAULT_DATA_DIR, loadConfig } from '../src/config.js';
 import { LoginLimiter, hashPassword, isValidPasswordHash, verifyPassword } from '../src/auth.js';
 import { SAMPLE_ROWS, fakeTransport, makeMailer, makeTempDir, makeWorkbookBuffer } from './helpers.js';
 
@@ -123,7 +123,16 @@ test('production configuration: strict requirements and safe defaults', async ()
   const ok = loadConfig(prodEnv(undefined, { DATA_DIR: '' }));
   assert.deepEqual(ok.fatal, []);
   assert.equal(ok.isProduction, true);
-  assert.equal(ok.dataDir, '/var/data');
+  // Without DATA_DIR (e.g. Render Free, no disk): app folder, flagged as temporary.
+  assert.equal(ok.dataDir, DEFAULT_DATA_DIR);
+  assert.equal(ok.persistentStorage, false);
+  assert.match(ok.storageWarning, /history.*template.*mapping.*sessions.*restarts/);
+  // With DATA_DIR (a persistent disk): persistent.
+  const disk = loadConfig(prodEnv('/var/data'));
+  assert.equal(disk.dataDir, '/var/data');
+  assert.equal(disk.persistentStorage, true);
+  assert.equal(disk.storageWarning, null);
+  assert.equal(loadConfig({}).persistentStorage, true, 'local PC folder is permanent');
   assert.equal(ok.host, '0.0.0.0');
   assert.equal(ok.trustProxy, 1);
   assert.deepEqual(ok.allowedOrigins, [ORIGIN], 'exactly one origin, never a wildcard');
@@ -393,4 +402,24 @@ test('production ignores backend/.env; only the platform environment is used', a
   // Locally the file still wins (switching mailboxes by editing .env keeps working).
   const local = loadConfigFromEnvFile(envPath, { SMTP_USER: 'other@example.com' });
   assert.equal(local.smtp.user, 'local-file@zodiacpatent.example');
+});
+
+test('without DATA_DIR (Render Free) the app runs and tells signed-in users that storage is temporary', async () => {
+  const dataDir = await makeTempDir();
+  const config = loadConfig(prodEnv(undefined, { DATA_DIR: '' }));
+  assert.deepEqual(config.fatal, []);
+  const app = createApp({ config, dataDir, mailer: makeMailer(fakeTransport(), config) });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const login = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { origin: ORIGIN, 'x-oea-request': '1', 'content-type': 'application/json' }, body: JSON.stringify({ username: 'zodiac-team', password: PASSWORD }) });
+    assert.equal(login.status, 200);
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const status = await (await fetch(`${base}/api/smtp/status`, { headers: { cookie } })).json();
+    assert.match(status.data.storageWarning, /lost whenever the server restarts/);
+    const history = await (await fetch(`${base}/api/history`, { headers: { cookie } })).json();
+    assert.equal(history.data.file, 'backend/data/sent-emails.xlsx');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
 });

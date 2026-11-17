@@ -5,20 +5,45 @@ This guide moves the app from a single Windows PC to a hosted setup the whole te
 | Part | Where | Address |
 |---|---|---|
 | Frontend (React, static files) | **Vercel** | `https://app.zodiacpatent.com` |
-| Backend API (Node/Express) | **Render**, paid Web Service | `https://api.zodiacpatent.com` |
-| History, templates, mapping, sessions | **Render Persistent Disk** | `/var/data` |
+| Backend API (Node/Express) | **Render**, Free Web Service | `https://api.zodiacpatent.com` |
+| History, templates, mapping, sessions | **Temporary** app folder on Render (no disk) | `backend/data` inside the service |
 | Outgoing email | **Hostinger SMTP** | `smtp.hostinger.com:465` |
 | Access | One **shared team login** | — |
 
 ```
 Browser ──HTTPS──▶ app.zodiacpatent.com (Vercel: static files only, no secrets)
    │
-   └──HTTPS + session cookie──▶ api.zodiacpatent.com (Render, 1 instance)
-                                   ├── /var/data  (persistent disk)
+   └──HTTPS + session cookie──▶ api.zodiacpatent.com (Render Free, 1 instance)
+                                   ├── backend/data  (TEMPORARY: wiped on restart)
                                    └── smtp.hostinger.com:465 (App Password)
 ```
 
 **Where secrets live:** the SMTP App Password, the login password hash and the session secret exist **only** as Render environment variables. Vercel only knows the public API address. The browser only ever holds an HttpOnly session cookie that JavaScript can't read.
+
+---
+
+## Render Free: what is not kept
+
+This setup uses **Render Free without a persistent disk**. The backend stores its files in its own app folder (`backend/data`), which Render **wipes whenever the service restarts, redeploys, or wakes up after sleeping**. Free services go to sleep after about 15 minutes without traffic, so expect this to happen often, typically several times a day.
+
+| Data | Kept after a restart, sleep or redeploy? |
+|---|---|
+| **Sending history** (`sent-emails.xlsx`, pending rows) | **No, lost** |
+| **Email template** you saved (`template.json`) | **No.** It goes back to the default ZodiacPatent template. |
+| **Column mapping** (`settings.json`) | **No.** Columns are guessed again from the headings. |
+| **Sign-in sessions** (`sessions/`) | **No.** Everyone has to sign in again. |
+| **Uploaded attorney workbook** | No (it was never stored on disk, even with a disk) |
+| SMTP settings, team login, all environment variables | **Yes**, they're Render settings, not files |
+| Sent emails themselves | Yes, already delivered by Hostinger |
+
+**What this means in practice:**
+
+- **Duplicate protection only covers emails sent since the last restart.** After the service sleeps or redeploys, the app no longer knows who was already emailed and won't warn before emailing them again. Keep your own record (or check the mailbox) before re-sending to an attorney.
+- **Save the template text somewhere else** (for example in a document), and paste it back into Template Settings after a restart.
+- **The app shows a "Temporary storage" warning** at the top of every page while it runs this way, and the Render log says `Data folder: … (TEMPORARY)`.
+- The first request after the service has been asleep takes up to about a minute while Render starts it.
+
+**To make data permanent later** (no code changes): move the service to a paid instance type, add a persistent disk mounted at `/var/data`, and add the environment variable `DATA_DIR=/var/data`. Don't set `DATA_DIR` without a disk: the server deliberately refuses to start if that folder is missing, so it can't silently lose data.
 
 ---
 
@@ -45,7 +70,7 @@ Browser ──HTTPS──▶ app.zodiacpatent.com (Vercel: static files only, no
 You need:
 
 - A **GitHub** account (a **private** repository is strongly recommended).
-- A **Render** account with billing enabled. Persistent disks are only available on paid instance types.
+- A **Render** account (the Free plan is enough for this setup; see the section above for what that costs you in stored data).
 - A **Vercel** account.
 - Access to the **DNS settings for zodiacpatent.com** (normally Hostinger hPanel → *Domains* → *DNS / Nameservers*, if Hostinger hosts the domain).
 - A **Hostinger App Password** for the sending mailbox (see the README, "Hostinger App Password").
@@ -113,7 +138,7 @@ APP_PASSWORD_HASH=scrypt:32768:8:1:....:....
 The repository contains `render.yaml`, which describes the service, its disk and its settings.
 
 1. Render dashboard → **New** → **Blueprint** → connect GitHub and choose the repository.
-2. Render reads `render.yaml` and shows the **zodiacpatent-api** web service with a 1 GB disk at `/var/data`.
+2. Render reads `render.yaml` and shows the **zodiacpatent-api** web service on the **Free** plan, with no disk.
 3. It asks for the values marked `sync: false`:
 
    | Variable | Value |
@@ -136,23 +161,26 @@ The repository contains `render.yaml`, which describes the service, its disk and
 | Runtime | Node |
 | Build Command | `npm ci --omit=dev` |
 | Start Command | `node src/server.js` |
-| Instance type | any **paid** type (Starter is enough) |
+| Instance type | **Free** |
 | Health Check Path | `/healthz` |
 | Auto-Deploy | Off (recommended; see section 11) |
 
-Then **Disks** → **Add disk**: name `zodiacpatent-data`, mount path **`/var/data`**, size 1 GB. Finally add every variable from [section 8](#8-environment-variable-reference) under **Environment**.
+Don't add a disk, and **don't set `DATA_DIR`**. Then add every variable from [section 8](#8-environment-variable-reference) under **Environment**.
+
+> **If the log says `The data folder /var/data is not available`:** `DATA_DIR` is set in the service's Environment (for example from an earlier version of `render.yaml`). Delete the `DATA_DIR` variable and deploy again.
 
 ### What to look for in the Render logs
 
 ```
-[config] Production mode. Data folder: /var/data
+[config] WARNING: DATA_DIR is not set, so /opt/render/project/src/backend/data is used. Temporary storage: …
+[config] Production mode. Data folder: /opt/render/project/src/backend/data (TEMPORARY)
 [config] Team login: required
 [config] Allowed frontend origin: https://app.zodiacpatent.com
 [config] Sending as darshan@zodiacpatent.com via smtp.hostinger.com:465 (SSL)
 Backend listening on 0.0.0.0:10000
 ```
 
-The server **refuses to start** if something important is wrong, and the log says exactly what. This happens when a login variable is missing, `FRONTEND_URL` isn't `https://`, `ALLOWED_HOSTS` is empty, or the disk isn't mounted at `/var/data`. It never falls back to temporary storage or runs without a login.
+The server **refuses to start** if something important is wrong, and the log says exactly what. This happens when a login variable is missing, `FRONTEND_URL` isn't `https://`, `ALLOWED_HOSTS` is empty, or `DATA_DIR` is set to a folder that doesn't exist. It never runs without a login.
 
 Check `https://<service-name>.onrender.com/healthz`. It should return `{"ok":true}`.
 
@@ -218,9 +246,9 @@ Add each domain in its platform first. The platform then shows the exact DNS rec
 4. Sign in with the shared username and password.
 5. The top bar shows **Sending as <mailbox>**. Click **Test SMTP Connection**. It must say the connection succeeded (no email is sent).
 6. Upload a workbook, check the mapping and template, then send **one** test email to an address you own.
-7. **Sent History** shows the send. It's stored in `/var/data/sent-emails.xlsx`.
+7. **Sent History** shows the send. On Render Free this history is temporary (see the top of this guide).
 8. **Sign out**, then sign in again.
-9. Optional: in Render, **Manual Deploy → Deploy latest commit**. After the restart, check that Sent History and your template are still there.
+9. Expect the "Temporary storage" warning at the top of the page. It's correct for Render Free.
 
 ---
 
@@ -232,7 +260,7 @@ Add each domain in its platform first. The platform then shows the exact DNS rec
 |---|---|---|---|
 | `NODE_ENV` | Yes | `production` | Turns on production mode: login required, Secure cookies, HSTS, `.env` file ignored. |
 | `NODE_VERSION` | Recommended | `20` | Node.js version Render installs (20.19 or newer). |
-| `DATA_DIR` | Yes | `/var/data` | Must be the disk mount path. Default in production: `/var/data`. |
+| `DATA_DIR` | **No (leave unset on Render Free)** | `/var/data` | Only with a persistent disk: set it to the disk's mount path. Unset means the temporary app folder is used. If set, the folder must exist or the server won't start. |
 | `FRONTEND_URL` | Yes | `https://app.zodiacpatent.com` | The **only** origin allowed to call the API (exact match, https, no path). |
 | `ALLOWED_HOSTS` | Yes | `api.zodiacpatent.com` | Host names the API answers to. Render's own `*.onrender.com` name is added automatically. Comma-separated if several. |
 | `TRUST_PROXY` | Recommended | `1` | Number of proxy hops in front of the app, used to find the client IP for login rate limiting. |
@@ -261,9 +289,11 @@ The desktop launcher keeps working as before with `backend\.env`. Without `APP_U
 
 ---
 
-## 9. Persistent disk
+## 9. Persistent disk (optional, paid; not used on Render Free)
 
-Everything that must survive restarts and deploys is written under `/var/data`:
+> On Render Free there is no disk: the same files below are written to the temporary `backend/data` folder and lost on restart (see the top of this guide). This section applies once you add a disk and set `DATA_DIR=/var/data`.
+
+With a disk, everything that must survive restarts and deploys is written under `/var/data`:
 
 ```
 /var/data/
@@ -286,7 +316,7 @@ Everything that must survive restarts and deploys is written under `/var/data`:
 
 - **One shared login.** Everyone uses the same username and password; each browser gets its own session. There's no per-person user management.
 - **One shared workbook.** The uploaded attorney workbook is shared by everyone signed in. **Uploading a different workbook replaces it for the whole team.** Agree who uploads, and re-check the attorney list after someone else uploads.
-- **After a restart or deploy, upload the workbook again.** It's kept in memory only (by design, so attorney data isn't stored on the server). The template, column mapping and history are kept.
+- **After a restart or deploy, upload the workbook again.** It's kept in memory only (by design, so attorney data isn't stored on the server). On Render Free the template, column mapping and history are lost too (with a disk they would be kept).
 - **Sending is one at a time.** When two people click **Send Email** together, the second waits until the first has finished, including the duplicate check and history write. So the second person always sees the first person's send, and the duplicate warning works across the team.
 - **Template edits are shared.** The last person to click **Save Template** wins.
 - **Sign out** on shared computers. Sessions end after 2 hours of inactivity or 12 hours in total.
@@ -331,7 +361,8 @@ Everything that must survive restarts and deploys is written under `/var/data`:
 - [ ] The password is stored only as an scrypt hash (N=32768, r=8, p=1, random salt). Session files are named by HMAC-SHA256(SESSION_SECRET, session ID), so the disk contents can't be turned into a valid cookie.
 
 **Operations**
-- [ ] Only **one** Render instance (a disk forces this; don't try to scale out).
+- [ ] Only **one** Render instance (don't scale out).
+- [ ] Everyone on the team knows that on Render Free, history and duplicate protection reset on every restart.
 - [ ] Health check path is `/healthz`. It reveals nothing beyond OK / not OK.
 - [ ] Download a copy of `sent-emails.xlsx` regularly, in addition to Render's disk snapshots.
 - [ ] Revoke the Hostinger App Password (hPanel) and change the shared password when someone leaves the team.
@@ -342,19 +373,20 @@ Everything that must survive restarts and deploys is written under `/var/data`:
 
 These were considered and deliberately left as they are for a small team, but you should know about them.
 
-1. **Not yet tested on real Render/Vercel/DNS.** Everything was tested locally:
+1. **Render Free storage is temporary.** History, the saved template, the column mapping and sessions are lost on every restart, sleep or redeploy, and duplicate protection only covers sends since the last restart (see the top of this guide). Free services also sleep when idle and take up to a minute to wake. Render may also restrict outgoing mail ports on free services; if **Test SMTP Connection** fails on Free with a connection error (not a login error), that's the likely cause, and a paid instance is needed to send.
+2. **Not yet tested on real Render/Vercel/DNS.** Everything was tested locally:
    - 71 automated backend tests, including production-mode login, cookies, CSRF, CORS, host checks, session persistence and expiry, rate limiting and team concurrency.
    - Isolated `npm ci` installs of `backend/` and `frontend/` to mimic how Render and Vercel build.
    - An end-to-end browser test with the frontend and API on separate origins of the same site, using production-mode cookies and the Vercel security headers.
 
    Run the checks in [section 7](#7-check-the-deployment) after the first deploy.
-2. **Uploaded workbook is in memory.** It's lost on every restart or deploy and must be uploaded again. It's shared by everyone, so the last upload wins.
-3. **Single instance, brief downtime on deploy.** Services with a persistent disk can't do zero-downtime deploys or run several instances. The app's locks (one send at a time, serialized history writes) assume one process.
-4. **Sending is serialized.** If Hostinger is slow or times out (up to about a minute in the worst case), other team members' sends wait.
-5. **Shared login = no per-person audit trail.** The history records the sending *mailbox*, not which team member clicked Send.
-6. **Rate limiting is in memory.** It resets on restart. Per-client limits rely on Render passing the real client IP (`TRUST_PROXY=1`). If that ever stops working, all clients share one counter, so 5 wrong attempts would briefly lock out the whole team (safe, but inconvenient).
-7. **Session revocation** for everyone at once is done by changing `SESSION_SECRET`. There's no "sign out this one browser remotely".
-8. **Hosted history and PC history are separate.** If the Windows desktop version is still used for sending, its `backend\data\sent-emails.xlsx` is a different file, and duplicate detection won't see sends made in the other one. Use one or the other, or copy the history over once (section 9) and stop sending from the PC.
-9. **Attorney data now leaves the PC.** When hosted, the uploaded workbook goes to the Render server (in memory) over HTTPS, and history (names, emails, firms) is stored on the Render disk. Make sure this fits your data-handling obligations.
-10. **Outgoing SMTP from Render.** Some hosts restrict outgoing mail ports on free plans. This setup uses a paid instance. Confirm with **Test SMTP Connection** after deploying. Hostinger's own sending limits still apply.
-11. **The history workbook can only be downloaded through Render's Shell/SSH.** There's no download button in the app yet.
+3. **Uploaded workbook is in memory.** It's lost on every restart or deploy and must be uploaded again. It's shared by everyone, so the last upload wins.
+4. **Single instance, brief downtime on deploy.** Services with a persistent disk can't do zero-downtime deploys or run several instances. The app's locks (one send at a time, serialized history writes) assume one process.
+5. **Sending is serialized.** If Hostinger is slow or times out (up to about a minute in the worst case), other team members' sends wait.
+6. **Shared login = no per-person audit trail.** The history records the sending *mailbox*, not which team member clicked Send.
+7. **Rate limiting is in memory.** It resets on restart. Per-client limits rely on Render passing the real client IP (`TRUST_PROXY=1`). If that ever stops working, all clients share one counter, so 5 wrong attempts would briefly lock out the whole team (safe, but inconvenient).
+8. **Session revocation** for everyone at once is done by changing `SESSION_SECRET`. There's no "sign out this one browser remotely".
+9. **Hosted history and PC history are separate.** If the Windows desktop version is still used for sending, its `backend\data\sent-emails.xlsx` is a different file, and duplicate detection won't see sends made in the other one. Use one or the other, or copy the history over once (section 9) and stop sending from the PC.
+10. **Attorney data now leaves the PC.** When hosted, the uploaded workbook goes to the Render server (in memory) over HTTPS, and history (names, emails, firms) is stored on the Render disk. Make sure this fits your data-handling obligations.
+11. **Outgoing SMTP from Render.** Confirm with **Test SMTP Connection** after deploying (see item 1 about free services). Hostinger's own sending limits still apply.
+12. **The history workbook can only be downloaded through Render's Shell/SSH.** There's no download button in the app yet.

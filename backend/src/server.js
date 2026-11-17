@@ -13,11 +13,13 @@ if (config.fatal.length) {
   process.exit(1);
 }
 
-// Persistent data folder. In production this must be the mounted Render disk:
-// never create it, so a missing disk can't silently fall back to temporary storage.
+// Data folder. When DATA_DIR is set explicitly in production (a mounted disk) it
+// must already exist: it is never created, so a missing disk can't silently fall
+// back to temporary storage. Without DATA_DIR the app folder is used (temporary
+// on hosts without a disk, such as Render Free).
 const dataDir = config.dataDir;
 try {
-  if (config.isProduction) {
+  if (config.isProduction && config.explicitDataDir) {
     if (!fs.statSync(dataDir).isDirectory()) throw new Error('not a directory');
     fs.accessSync(dataDir, fs.constants.R_OK | fs.constants.W_OK);
     const probe = path.join(dataDir, `.write-test-${process.pid}`);
@@ -27,12 +29,18 @@ try {
     fs.mkdirSync(dataDir, { recursive: true });
   }
 } catch (err) {
-  console.error(`[config] The data folder ${dataDir} is not available (${err.code || err.message}). In production, attach the Render persistent disk at this mount path.`);
+  console.error(
+    `[config] The data folder ${dataDir} is not available (${err.code || err.message}). ` +
+      (config.explicitDataDir
+        ? 'Attach a persistent disk at this path, or remove the DATA_DIR environment variable to use temporary storage (e.g. on Render Free).'
+        : 'Check that the app folder is writable.'),
+  );
   process.exit(1);
 }
 
 for (const w of config.warnings) console.warn(`[config] ${w}`);
-console.log(`[config] ${config.isProduction ? 'Production' : 'Local'} mode. Data folder: ${dataDir}`);
+if (config.storageWarning) console.warn(`[config] WARNING: DATA_DIR is not set, so ${dataDir} is used. ${config.storageWarning}`);
+console.log(`[config] ${config.isProduction ? 'Production' : 'Local'} mode. Data folder: ${dataDir} (${config.persistentStorage ? 'persistent' : 'TEMPORARY'})`);
 console.log(`[config] Team login: ${config.auth.enabled ? 'required' : 'disabled (local use only)'}`);
 if (config.isProduction) console.log(`[config] Allowed frontend origin: ${config.allowedOrigins.join(', ')}`);
 
