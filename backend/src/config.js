@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
+import { isValidPasswordHash } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const BACKEND_ROOT = path.resolve(__dirname, '..');
@@ -33,8 +34,59 @@ export function loadConfig(env = process.env) {
   const problems = [];
   const warnings = [];
 
+  const fatal = []; // problems that must stop the server from starting
+  const isProduction = String(env.NODE_ENV || '').trim().toLowerCase() === 'production';
+
   const port = Number.parseInt(env.PORT || '4000', 10);
-  const frontendUrl = (clean(env.FRONTEND_URL) || 'http://localhost:5173').replace(/\/+$/, '');
+  const frontendUrl = (clean(env.FRONTEND_URL) || (isProduction ? '' : 'http://localhost:5173')).replace(/\/+$/, '');
+  let frontendOrigin = '';
+  try {
+    const u = new URL(frontendUrl);
+    frontendOrigin = u.origin;
+    if (u.pathname !== '/' || u.search || u.hash) fatal.push('FRONTEND_URL must be an origin only, e.g. https://app.zodiacpatent.com (no path).');
+    if (isProduction && u.protocol !== 'https:') fatal.push('FRONTEND_URL must use https:// in production.');
+  } catch {
+    fatal.push(isProduction ? 'FRONTEND_URL must be set to the exact frontend origin, e.g. https://app.zodiacpatent.com.' : 'FRONTEND_URL is not a valid URL.');
+  }
+  // Exact origins allowed to call the API with credentials (never a wildcard).
+  const allowedOrigins = frontendOrigin ? [frontendOrigin] : [];
+  if (!isProduction && frontendOrigin.includes('localhost')) allowedOrigins.push(frontendOrigin.replace('localhost', '127.0.0.1'));
+
+  // Where templates, mapping, history and sessions are stored. On Render this is
+  // the persistent disk; the source directory is replaced on every deploy.
+  const dataDir = clean(env.DATA_DIR) || (isProduction ? '/var/data' : DEFAULT_DATA_DIR);
+  if (isProduction && !path.posix.isAbsolute(dataDir) && !path.isAbsolute(dataDir)) fatal.push('DATA_DIR must be an absolute path (e.g. /var/data).');
+
+  // Host names this server answers to (besides localhost). Render's own
+  // *.onrender.com host name is added automatically.
+  const allowedHosts = String(env.ALLOWED_HOSTS || '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+  if (clean(env.RENDER_EXTERNAL_HOSTNAME)) allowedHosts.push(clean(env.RENDER_EXTERNAL_HOSTNAME).toLowerCase());
+  if (isProduction && !allowedHosts.length) fatal.push('ALLOWED_HOSTS must list the API host name, e.g. api.zodiacpatent.com.');
+
+  const trustProxyRaw = String(env.TRUST_PROXY ?? (isProduction ? '1' : '')).trim().toLowerCase();
+  const trustProxy = /^\d+$/.test(trustProxyRaw) ? Number(trustProxyRaw) : false;
+
+  // Shared team login.
+  const username = String(env.APP_USERNAME ?? '').trim();
+  const passwordHash = String(env.APP_PASSWORD_HASH ?? '').trim();
+  const sessionSecret = String(env.SESSION_SECRET ?? '').trim();
+  const authAny = Boolean(username || passwordHash || sessionSecret);
+  const authErrors = [];
+  if (!username) authErrors.push('APP_USERNAME is not set');
+  if (!passwordHash) authErrors.push('APP_PASSWORD_HASH is not set (generate it with: npm run hash-password)');
+  else if (!isValidPasswordHash(passwordHash)) authErrors.push('APP_PASSWORD_HASH is not a valid hash (generate it with: npm run hash-password)');
+  if (!sessionSecret) authErrors.push('SESSION_SECRET is not set');
+  else if (sessionSecret.length < 32) authErrors.push('SESSION_SECRET must be at least 32 characters');
+  if ((isProduction || authAny) && authErrors.length) fatal.push(...authErrors.map((e) => `Login: ${e}.`));
+  const hours = (v, d) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d; };
+  const auth = {
+    enabled: authAny && !authErrors.length,
+    username,
+    passwordHash,
+    sessionSecret,
+    idleMs: hours(env.SESSION_IDLE_HOURS, 2) * 3600 * 1000,
+    maxAgeMs: hours(env.SESSION_MAX_AGE_HOURS, 12) * 3600 * 1000,
+  };
 
   const host = clean(env.SMTP_HOST) || 'smtp.hostinger.com';
   const smtpPort = Number.parseInt(clean(env.SMTP_PORT) || '465', 10);
@@ -57,9 +109,17 @@ export function loadConfig(env = process.env) {
   }
 
   return {
+    isProduction,
     port: Number.isFinite(port) ? port : 4000,
-    host: '127.0.0.1',
+    // Production listens on all interfaces (Render routes traffic to it); local use stays on loopback.
+    host: clean(env.HOST) || (isProduction ? '0.0.0.0' : '127.0.0.1'),
     frontendUrl,
+    allowedOrigins,
+    allowedHosts,
+    trustProxy,
+    dataDir,
+    auth,
+    fatal,
     smtp: { host, port: smtpPort, secure, user, pass, from },
     smtpConfigured: problems.length === 0,
     problems,
@@ -74,8 +134,13 @@ export const DEFAULT_ENV_FILE = path.join(BACKEND_ROOT, '.env');
  * Values in the .env file take precedence over variables already set in the
  * Windows environment, so switching mailboxes only ever needs a .env edit and
  * a restart. The sender address is never hard-coded in the source.
+ *
+ * In production (NODE_ENV=production set by the platform, e.g. Render) the .env
+ * file is ignored entirely: only the platform's environment variables are used,
+ * so a stray local file can never change the deployed configuration.
  */
 export function loadConfigFromEnvFile(envPath = DEFAULT_ENV_FILE, baseEnv = process.env) {
+  if (String(baseEnv.NODE_ENV || '').trim().toLowerCase() === 'production') return loadConfig({ ...baseEnv });
   let fileValues = {};
   try {
     fileValues = dotenv.parse(fs.readFileSync(envPath));

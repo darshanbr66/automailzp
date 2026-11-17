@@ -1,7 +1,9 @@
 import path from 'node:path';
 import express from 'express';
 import multer from 'multer';
-import { AppError, isPlainObject, normalizeId, readJsonFile, writeJsonFile, formatDateTime } from './utils.js';
+import fs from 'node:fs/promises';
+import { AppError, Mutex, isPlainObject, normalizeId, readJsonFile, writeJsonFile, formatDateTime } from './utils.js';
+import { FileSessionStore, LoginLimiter, parseCookies, safeEqual, sessionCookie, verifyPassword } from './auth.js';
 import {
   MAPPING_FIELDS, MAX_UPLOAD_BYTES, getRecordValues, listPlaceholders, parseWorkbook,
   resolveMapping, sanitizeMapping, validateExcelFile, validateMapping,
@@ -12,6 +14,8 @@ import { isValidEmail, validateMessage } from './email.js';
 import { countsAsSent, matchHistory, normalizeEmail, normalizeText, recordIdentity } from './identity.js';
 
 const CSRF_HEADER = 'x-oea-request';
+const CSRF_TOKEN_HEADER = 'x-csrf-token';
+const AUTH_PUBLIC_PATHS = new Set(['/auth/session', '/auth/login', '/auth/logout']);
 const REQUEST_ID_RE = /^[A-Za-z0-9-]{8,100}$/;
 export const PAGE_SIZE = 10;
 const MAX_QUERY = 200;
@@ -22,52 +26,176 @@ const MAX_QUERY = 200;
  * @param {object} deps.config       result of loadConfig()
  * @param {string} deps.dataDir      directory for template, mapping and history files
  * @param {import('./email.js').SmtpMailer|null} deps.mailer  null when SMTP is not configured
+ * @param {object} [deps.loginLimiter]  replaced in tests
  */
-export function createApp({ config, dataDir, mailer }) {
+export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLimiter() }) {
   const app = express();
   const templates = new TemplateStore(dataDir);
   const history = new HistoryStore(dataDir);
   const settingsPath = path.join(dataDir, 'settings.json');
 
-  // Attorney data lives only in memory; it is never written to disk.
+  // Attorney data lives only in memory; it is never written to disk. It is
+  // shared by everyone signed in: uploading a workbook replaces it for the team.
   let workbook = null;
+  // One send at a time across the whole team: the duplicate check, the SMTP send
+  // and the history write happen as one serialized step (single service instance).
+  const sendMutex = new Mutex();
+  const settingsMutex = new Mutex();
   const sendingRecords = new Set(); // normalized record IDs currently being sent
   const sendRequests = new Map(); // requestId -> { status, response, at }
   let lastSmtpTest = null; // { ok, at, message, code }
   let smtpTestRunning = null;
 
-  const frontendOrigin = new URL(config.frontendUrl).origin;
-  const allowedOrigins = new Set([frontendOrigin, frontendOrigin.replace('localhost', '127.0.0.1')]);
+  const allowedOrigins = new Set(config.allowedOrigins);
+  const authEnabled = Boolean(config.auth?.enabled);
+  const cookie = sessionCookie(config.isProduction);
+  const sessions = authEnabled
+    ? new FileSessionStore(path.join(dataDir, 'sessions'), { secret: config.auth.sessionSecret, idleMs: config.auth.idleMs, maxAgeMs: config.auth.maxAgeMs })
+    : null;
+  if (sessions) {
+    const sweep = setInterval(() => sessions.sweep().catch(() => {}), 30 * 60 * 1000);
+    sweep.unref();
+  }
+  const envWhere = config.isProduction ? 'the Render environment variables' : 'backend/.env (see README)';
+  const historyFileLabel = config.isProduction ? path.posix.join(dataDir, 'sent-emails.xlsx') : 'backend/data/sent-emails.xlsx';
 
   app.disable('x-powered-by');
-  app.set('trust proxy', false);
+  app.set('trust proxy', config.trustProxy ?? false);
 
-  // ---- Local-only protections -------------------------------------------
+  // ---- Health check (Render) -----------------------------------------------
+  // Public and minimal: reports only whether the service and its data folder are usable.
+  app.get('/healthz', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    try {
+      await fs.access(dataDir, fs.constants.W_OK);
+      res.json({ ok: true });
+    } catch {
+      res.status(503).json({ ok: false });
+    }
+  });
+
+  // ---- Host check and security headers ---------------------------------------
   app.use((req, res, next) => {
-    // Reject requests whose Host is not localhost (DNS-rebinding protection).
+    // Only answer to known host names (DNS-rebinding protection).
     const host = String(req.headers.host || '').toLowerCase();
     const port = req.socket.localPort;
-    const okHosts = new Set([`localhost:${port}`, `127.0.0.1:${port}`, new URL(config.frontendUrl).host, new URL(config.frontendUrl).host.replace('localhost', '127.0.0.1')]);
-    if (!okHosts.has(host)) return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN_HOST', message: 'Forbidden' } });
+    const okHosts = new Set([`localhost:${port}`, `127.0.0.1:${port}`, ...config.allowedHosts]);
+    try {
+      const fe = new URL(config.frontendUrl).host;
+      if (!config.isProduction) okHosts.add(fe).add(fe.replace('localhost', '127.0.0.1'));
+    } catch {
+      /* validated at start-up */
+    }
+    if (!okHosts.has(host) && !okHosts.has(host.replace(/:\d+$/, ''))) {
+      return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN_HOST', message: 'Forbidden' } });
+    }
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+    if (config.isProduction) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     if (req.path.startsWith('/api/')) res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
+
+  // ---- CORS: exactly one allowed frontend origin, with credentials ----------------
+  app.use('/api', (req, res, next) => {
+    const origin = req.headers.origin;
+    const allowed = origin && allowedOrigins.has(origin);
+    res.setHeader('Vary', 'Origin');
+    if (allowed) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+    if (req.method === 'OPTIONS') {
+      if (!allowed) return res.status(403).end();
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-OEA-Request, X-CSRF-Token');
+      res.setHeader('Access-Control-Max-Age', '600');
+      return res.status(204).end();
+    }
     next();
   });
 
   app.use('/api', (req, res, next) => {
     if (req.method === 'GET' || req.method === 'HEAD') return next();
-    // State-changing requests must come from our own frontend. Browsers do not
-    // let other sites add a custom header without a CORS preflight, which we never allow.
+    // State-changing requests must come from our own frontend: a custom header
+    // (which forces a CORS preflight) and, when sent, an allowed Origin. In
+    // production the Origin header is required.
     const origin = req.headers.origin;
-    if (req.headers[CSRF_HEADER] !== '1' || (origin && !allowedOrigins.has(origin))) {
+    if (req.headers[CSRF_HEADER] !== '1' || (origin && !allowedOrigins.has(origin)) || (config.isProduction && !origin)) {
       return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN', message: 'Request blocked for security reasons. Please use the application page.' } });
     }
     next();
   });
 
   app.use(express.json({ limit: '1mb' }));
+
+  // ---- Shared team login --------------------------------------------------------
+  async function currentSession(req) {
+    if (!sessions) return null;
+    const id = parseCookies(req.headers.cookie)[cookie.name];
+    if (!id) return null;
+    const session = await sessions.get(id);
+    return session ? { id, session } : null;
+  }
+
+  app.get('/api/auth/session', async (req, res) => {
+    if (!authEnabled) return res.json({ ok: true, data: { authRequired: false, authenticated: true } });
+    const found = await currentSession(req);
+    if (!found) return res.json({ ok: true, data: { authRequired: true, authenticated: false } });
+    res.json({ ok: true, data: { authRequired: true, authenticated: true, username: found.session.username, csrfToken: found.session.csrfToken } });
+  });
+
+  app.post('/api/auth/login', async (req, res) => {
+    if (!authEnabled) throw new AppError(400, 'AUTH_DISABLED', 'Login is not enabled on this server.');
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const wait = loginLimiter.retryAfter(ip);
+    if (wait) {
+      res.setHeader('Retry-After', String(wait));
+      throw new AppError(429, 'TOO_MANY_ATTEMPTS', `Too many failed sign-in attempts. Please wait ${Math.ceil(wait / 60)} minute(s) and try again.`);
+    }
+    const { username, password } = req.body || {};
+    const u = typeof username === 'string' ? username.trim().slice(0, 200) : '';
+    const pw = typeof password === 'string' ? password.slice(0, 1024) : '';
+    // Always run the (slow) password check so timing doesn't reveal a correct username.
+    const passwordOk = await verifyPassword(pw, config.auth.passwordHash);
+    const userOk = safeEqual(u.toLowerCase(), config.auth.username.toLowerCase());
+    if (!passwordOk || !userOk) {
+      loginLimiter.fail(ip);
+      console.warn('[auth] Failed sign-in attempt');
+      throw new AppError(401, 'INVALID_LOGIN', 'Incorrect username or password.');
+    }
+    loginLimiter.succeed(ip);
+    const previous = await currentSession(req);
+    if (previous) await sessions.destroy(previous.id); // new session ID on every login
+    const { id, session } = await sessions.create(config.auth.username);
+    res.cookie(cookie.name, id, { ...cookie.options, maxAge: sessions.remainingMs(session) });
+    console.log('[auth] Signed in');
+    res.json({ ok: true, data: { authRequired: true, authenticated: true, username: session.username, csrfToken: session.csrfToken } });
+  });
+
+  app.post('/api/auth/logout', async (req, res) => {
+    if (sessions) {
+      const found = await currentSession(req);
+      if (found) await sessions.destroy(found.id);
+      res.clearCookie(cookie.name, cookie.options);
+    }
+    res.json({ ok: true, data: { authenticated: false } });
+  });
+
+  // Every other API endpoint requires a valid session and, for changes, the
+  // session's CSRF token.
+  app.use('/api', async (req, res, next) => {
+    if (!authEnabled || AUTH_PUBLIC_PATHS.has(req.path)) return next();
+    const found = await currentSession(req);
+    if (!found) return res.status(401).json({ ok: false, error: { code: 'AUTH_REQUIRED', message: 'Your session has ended. Please sign in again.' } });
+    if (req.method !== 'GET' && req.method !== 'HEAD' && !safeEqual(String(req.headers[CSRF_TOKEN_HEADER] || ''), found.session.csrfToken)) {
+      return res.status(403).json({ ok: false, error: { code: 'CSRF_FAILED', message: 'Your session could not be verified. Please reload the page.' } });
+    }
+    req.teamSession = found.session;
+    next();
+  });
 
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 5 } });
 
@@ -219,6 +347,7 @@ export function createApp({ config, dataDir, mailer }) {
       ...(mailer ? mailer.publicInfo() : { host: config.smtp.host, port: config.smtp.port, secure: config.smtp.secure, user: config.smtp.user, from: config.smtp.from }),
       problems: config.problems,
       warnings: config.warnings,
+      hosted: Boolean(config.isProduction),
       lastTest: lastSmtpTest,
     };
   }
@@ -231,7 +360,7 @@ export function createApp({ config, dataDir, mailer }) {
   app.get('/api/smtp/status', (req, res) => ok(res, smtpStatus()));
 
   app.post('/api/smtp/test', async (req, res) => {
-    if (!mailer) throw new AppError(503, 'SMTP_NOT_CONFIGURED', `Email sending is not configured: ${config.problems.join('; ')}. Edit backend/.env and restart the app.`, { problems: config.problems });
+    if (!mailer) throw new AppError(503, 'SMTP_NOT_CONFIGURED', `Email sending is not configured: ${config.problems.join('; ')}. Update ${envWhere} and restart the app.`, { problems: config.problems });
     // Concurrent clicks share one connection attempt.
     if (!smtpTestRunning) {
       smtpTestRunning = mailer
@@ -290,8 +419,10 @@ export function createApp({ config, dataDir, mailer }) {
       const errors = validateMapping(mapping, workbook.headers);
       if (errors.length) throw new AppError(400, 'INVALID_MAPPING', errors.join(' '), { errors });
     }
-    const settings = (await readJsonFile(settingsPath).catch(() => null)) || {};
-    await writeJsonFile(settingsPath, { ...(isPlainObject(settings) ? settings : {}), mapping });
+    await settingsMutex.run(async () => {
+      const settings = (await readJsonFile(settingsPath).catch(() => null)) || {};
+      await writeJsonFile(settingsPath, { ...(isPlainObject(settings) ? settings : {}), mapping });
+    });
     ok(res, await workbookPayload());
   });
 
@@ -352,7 +483,7 @@ export function createApp({ config, dataDir, mailer }) {
   });
 
   app.get('/api/history', async (req, res) => {
-    ok(res, { entries: await history.readAll(), file: 'backend/data/sent-emails.xlsx', sender: config.smtp.from || null });
+    ok(res, { entries: await history.readAll(), file: historyFileLabel, sender: config.smtp.from || null });
   });
 
   // ---- Send -----------------------------------------------------------------------
@@ -374,9 +505,9 @@ export function createApp({ config, dataDir, mailer }) {
     const to = values.get('recipientEmail');
     validateMessage({ to, subject, body });
 
-    if (!mailer) throw new AppError(503, 'SMTP_NOT_CONFIGURED', 'Email sending is not configured yet. Add the Hostinger SMTP settings and App Password to backend/.env (see README) and restart the app.');
+    if (!mailer) throw new AppError(503, 'SMTP_NOT_CONFIGURED', `Email sending is not configured yet. Add the Hostinger SMTP settings and App Password to ${envWhere} and restart the app.`);
 
-    // The sender is whatever mailbox backend/.env configured at start-up.
+    // The sender is whatever mailbox the environment configured at start-up.
     const senderEmail = mailer.publicInfo().from;
     const lockKey = normalizeId(recordId);
     if (sendingRecords.has(lockKey)) throw new AppError(409, 'SEND_IN_PROGRESS', 'An email to this attorney is already being sent. Please wait.');
@@ -384,6 +515,9 @@ export function createApp({ config, dataDir, mailer }) {
     sendRequests.set(requestId, { status: 'pending', at: Date.now() });
     let sendType = 'First Send';
     let attempted = false;
+    // Wait for any other team member's send to finish, so duplicate checks always
+    // see the latest history.
+    await sendMutex.run(async () => {
     try {
       const { exact, possible } = matchHistory(await history.entriesInOrder(), identity, values);
       if (exact.length && confirmResend !== true) {
@@ -430,6 +564,7 @@ export function createApp({ config, dataDir, mailer }) {
     } finally {
       sendingRecords.delete(lockKey);
     }
+    });
   });
 
   function historyEntry({ identity, values, subject, senderEmail, status, sendType }) {

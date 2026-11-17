@@ -47,13 +47,13 @@ export function mapSmtpError(err, phase, smtp) {
     return new AppError(
       401,
       'SMTP_AUTH_FAILED',
-      `Hostinger rejected the login for ${smtp.user}.${notSent} Check that SMTP_PASS in backend/.env is the App Password generated for this mailbox ` +
-        '(not your hPanel or mailbox password), that it was pasted without extra spaces, and that it has not been deleted in hPanel. Restart the app after changing backend/.env.',
+      `Hostinger rejected the login for ${smtp.user}.${notSent} Check that SMTP_PASS (backend/.env locally, or the Render environment when hosted) is the App Password generated for this mailbox ` +
+        '(not your hPanel or mailbox password), that it was pasted without extra spaces, and that it has not been deleted in hPanel. Restart the app after changing it.',
     );
   }
 
   if (code === 'EDNS' || /ENOTFOUND|EAI_AGAIN/.test(String(err?.message || ''))) {
-    return new AppError(503, 'SMTP_CONNECTION_FAILED', `Could not find the mail server "${smtp.host}". Check your internet connection and SMTP_HOST in backend/.env.${notSent}`);
+    return new AppError(503, 'SMTP_CONNECTION_FAILED', `Could not find the mail server "${smtp.host}". Check your internet connection and the SMTP_HOST setting.${notSent}`);
   }
 
   if (code === 'EENVELOPE' || (responseCode >= 500 && /^RCPT TO/i.test(command))) {

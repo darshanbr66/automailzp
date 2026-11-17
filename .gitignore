@@ -1,9 +1,12 @@
 # Dependencies and build output
 node_modules/
 frontend/dist/
+.vercel/
 
 # Secrets - never commit
 .env
+.env.*
+!.env.example
 backend/.env
 *.pem
 *.key

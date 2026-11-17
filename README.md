@@ -8,7 +8,9 @@ A small ZodiacPatent web app that runs on your own Windows computer. It lets a t
 4. Review and edit the email, then send it from your **ZodiacPatent Hostinger mailbox** (whichever `@zodiacpatent.com` address is set in `backend\.env`) over SMTP.
 5. Keep a sending history in a separate Excel workbook, with a warning before anyone is emailed twice.
 
-Attorney data stays on your computer. The only thing that leaves it is each email you choose to send, which goes to Hostinger's mail server. Emails are never sent automatically: you always click **Send Email** yourself.
+In the desktop version described here, attorney data stays on your computer. The only thing that leaves it is each email you choose to send, which goes to Hostinger's mail server. Emails are never sent automatically: you always click **Send Email** yourself.
+
+> **Hosted team version:** the same app can also run online for the whole team (frontend on Vercel at `https://app.zodiacpatent.com`, backend on Render at `https://api.zodiacpatent.com`, with one shared team login). See **[DEPLOYMENT.md](DEPLOYMENT.md)**. In the hosted version, uploaded workbooks and the sending history are on the Render server instead of this PC.
 
 ---
 
@@ -305,6 +307,7 @@ npm run setup            # install backend + frontend dependencies
 npm test                 # backend automated tests (node:test)
 npm run check            # backend syntax check
 npm run build            # frontend production build
+npm run hash-password    # create APP_PASSWORD_HASH for the shared team login (hosted version)
 npm run start:backend    # backend only (http://localhost:4000)
 npm run start:frontend   # Vite dev server (http://localhost:5173)
 ```

@@ -7,13 +7,32 @@ export class ApiError extends Error {
   }
 }
 
-const UNREACHABLE =
-  'Cannot reach the application server. Make sure the app is running (double-click the desktop shortcut) and try again.';
+// Hosted (Vercel): VITE_API_BASE_URL=https://api.zodiacpatent.com, set at build time.
+// Local: empty, so requests go to /api on the Vite dev server, which proxies them.
+export const API_BASE = String(import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+
+const UNREACHABLE = API_BASE
+  ? 'Cannot reach the ZodiacPatent server. Check your internet connection and try again.'
+  : 'Cannot reach the application server. Make sure the app is running (double-click the desktop shortcut) and try again.';
+
+// Session CSRF token (kept in memory only; the session itself is an HttpOnly cookie).
+let csrfToken = null;
+let onAuthRequired = null;
+export function setCsrfToken(token) {
+  csrfToken = token || null;
+}
+/** Called when the backend reports that the session has ended. */
+export function setAuthRequiredHandler(fn) {
+  onAuthRequired = fn;
+}
 
 /** Call the backend. Resolves with `data`, or throws ApiError with a user-friendly message. */
 export async function api(path, { method = 'GET', json, form } = {}) {
   const headers = {};
-  if (method !== 'GET') headers['X-OEA-Request'] = '1'; // required by the backend for changes
+  if (method !== 'GET') {
+    headers['X-OEA-Request'] = '1'; // required by the backend for changes
+    if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+  }
   let body;
   if (json !== undefined) {
     headers['Content-Type'] = 'application/json';
@@ -24,7 +43,7 @@ export async function api(path, { method = 'GET', json, form } = {}) {
 
   let res;
   try {
-    res = await fetch(path, { method, headers, body, credentials: 'same-origin' });
+    res = await fetch(API_BASE + path, { method, headers, body, credentials: 'include' });
   } catch {
     throw new ApiError(UNREACHABLE, { code: 'BACKEND_UNAVAILABLE' });
   }
@@ -42,6 +61,7 @@ export async function api(path, { method = 'GET', json, form } = {}) {
     });
   }
   if (!payload.ok) {
+    if (payload.error?.code === 'AUTH_REQUIRED' && onAuthRequired) onAuthRequired(payload.error.message);
     throw new ApiError(payload.error?.message || 'The request failed.', {
       code: payload.error?.code,
       status: res.status,
