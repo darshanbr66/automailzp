@@ -73,6 +73,12 @@ async function startProd({ dataDir, smtp = fakeTransport(), env = {}, loginLimit
       if (r.status === 200) c.csrf = r.data.data.csrfToken;
       return r;
     };
+    /** Preview a row and return the selection the server verifies on send (like the browser). */
+    c.select = async (rowNumber) => {
+      const p = await c.request('POST', '/api/preview', { json: { rowNumber } });
+      const { workbookVersion, mappingVersion, recordId, recipientEmail } = p.data.data;
+      return { workbookVersion, mappingVersion, recordId, recipientEmail };
+    };
     c.upload = (buffer) => {
       const f = new FormData();
       f.append('file', new Blob([buffer]), 'attorneys.xlsx');
@@ -372,7 +378,8 @@ test('team concurrency: sends from different sessions are serialized; duplicate 
     // Bob sees the workbook Alice uploaded (shared team workbook).
     assert.equal((await bob.request('GET', '/api/excel/records')).data.data.totalRecords, 3);
 
-    const send = (c, rowNumber) => c.request('POST', '/api/send', { json: { rowNumber, subject: 'S', body: 'B', requestId: rid() } });
+    const selections = { 2: await alice.select(2), 3: await bob.select(3), 4: await bob.select(4) };
+    const send = (c, rowNumber) => c.request('POST', '/api/send', { json: { rowNumber, subject: 'S', body: 'B', requestId: rid(), expected: selections[rowNumber] } });
     const results = await Promise.all([send(alice, 2), send(bob, 3), send(bob, 4)]);
     assert.equal(maxActive, 1, 'only one SMTP send at a time');
     const codes = results.map((r) => r.status);
@@ -472,4 +479,36 @@ test('frontend/vercel.json proxies /api to Render before the SPA fallback, with 
   const csp = vercel.headers.flatMap((h) => h.headers).find((h) => h.key === 'Content-Security-Policy').value;
   assert.match(csp, /connect-src 'self';/);
   assert.doesNotMatch(csp, /connect-src[^;]*https?:/, 'the browser never calls another origin');
+});
+
+test('two signed-in members: a workbook uploaded by Bob makes Alice\'s earlier selection stale (no wrong-recipient send)', async () => {
+  const srv = await startProd();
+  const alice = srv.client();
+  const bob = srv.client();
+  try {
+    await alice.login();
+    await bob.login();
+    const head = ['Full Name', 'Reg No', 'E-mail'];
+    assert.equal((await alice.upload(makeWorkbookBuffer([head, ['Attorney New', 'REG-NEW', 'new@example.com']]))).status, 200);
+    const sel = await alice.select(2);
+    assert.equal(sel.recipientEmail, 'new@example.com');
+
+    // The exact scenario from the audit: Bob uploads a different workbook.
+    assert.equal((await bob.upload(makeWorkbookBuffer([head, ['Attorney Other', 'REG-OTHER', 'other@example.com'], ['Attorney New', 'REG-NEW', 'new@example.com']]))).status, 200);
+    const r = await alice.request('POST', '/api/send', { json: { rowNumber: 2, subject: 'S', body: 'Dear Attorney New, ...', requestId: rid(), expected: sel } });
+    assert.equal(r.status, 409);
+    assert.equal(r.data.error.code, 'STALE_SELECTION');
+    assert.match(r.data.error.message, /reload the page/);
+    assert.equal(srv.smtp.state.sent.length, 0, 'other@example.com did not receive Alice\'s email');
+    assert.equal((await bob.request('GET', '/api/history')).data.data.entries.length, 0);
+
+    // Alice reloads and selects again: the email goes to the right attorney.
+    const fresh = await alice.select(3);
+    assert.equal(fresh.recipientEmail, 'new@example.com');
+    const ok = await alice.request('POST', '/api/send', { json: { rowNumber: 3, subject: 'S', body: 'Dear Attorney New, ...', requestId: rid(), expected: fresh } });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(srv.smtp.state.sent.map((m) => m.to), ['new@example.com']);
+  } finally {
+    await srv.close();
+  }
 });

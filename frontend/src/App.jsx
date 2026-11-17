@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, setAuthRequiredHandler, setCsrfToken } from './api.js';
 import LoginForm from './components/LoginForm.jsx';
+import { sessionSentNames } from './sentNames.js';
 import SmtpStatus from './components/SmtpStatus.jsx';
 import ComposePage from './components/ComposePage.jsx';
 import TemplatePage from './components/TemplatePage.jsx';
@@ -59,6 +60,7 @@ export default function App() {
       /* the session is cleared below either way */
     }
     setCsrfToken(null);
+    sessionSentNames.clear(); // a new sign-in starts a new list of sent names
     setWorkspaceShown(false);
     setAuth({ state: 'signin', message: 'You have signed out.' });
   };

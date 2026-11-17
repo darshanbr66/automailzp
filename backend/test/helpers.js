@@ -90,7 +90,21 @@ export async function startTestServer({ dataDir, mailer, config = testConfig() }
   const base = `http://127.0.0.1:${server.address().port}`;
   let cookie = '';
 
-  async function request(method, urlPath, { json, form, headers = {}, csrf = true } = {}) {
+  /**
+   * Like the browser: before sending (or checking history) for a row, preview it
+   * and attach the selection the server must verify (workbook/mapping versions,
+   * record ID, recipient). Pass { select: false } to send a request without it.
+   */
+  async function withSelection(json) {
+    if (!json || json.expected !== undefined || json.rowNumber === undefined) return json;
+    const p = await request('POST', '/api/preview', { json: { rowNumber: json.rowNumber }, select: false });
+    if (p.status !== 200) return json;
+    const { workbookVersion, mappingVersion, recordId, recipientEmail } = p.data.data;
+    return { ...json, expected: { workbookVersion, mappingVersion, recordId, recipientEmail } };
+  }
+
+  async function request(method, urlPath, { json, form, headers = {}, csrf = true, select = true } = {}) {
+    if (select && method === 'POST' && (urlPath === '/api/send' || urlPath === '/api/history/check')) json = await withSelection(json);
     const h = { ...headers };
     if (cookie) h.cookie = cookie;
     if (csrf && method !== 'GET') h['x-oea-request'] = '1';

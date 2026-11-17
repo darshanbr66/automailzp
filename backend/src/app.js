@@ -2,6 +2,7 @@ import path from 'node:path';
 import express from 'express';
 import multer from 'multer';
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 import { AppError, Mutex, isPlainObject, normalizeId, readJsonFile, writeJsonFile, formatDateTime } from './utils.js';
 import { FileSessionStore, LoginLimiter, parseCookies, safeEqual, sessionCookie, verifyPassword } from './auth.js';
 import {
@@ -221,16 +222,49 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     return workbook;
   }
 
-  async function requireValidMapping() {
-    const wb = requireWorkbook();
-    const mapping = await currentMapping();
-    const errors = validateMapping(mapping, wb.headers);
-    if (errors.length) throw new AppError(400, 'INVALID_MAPPING', errors.join(' '), { errors });
-    return mapping;
+  /** Fingerprint of a column mapping: changes whenever the mapping changes. */
+  function mappingVersionOf(mapping) {
+    return crypto.createHash('sha256').update(JSON.stringify(mapping)).digest('hex').slice(0, 16);
   }
 
-  function findRow(rowNumber) {
+  /**
+   * One consistent view of the shared workbook and mapping for this request.
+   * The workbook object is captured once, so a concurrent upload by another team
+   * member can't mix rows from one workbook with the mapping of another.
+   */
+  async function snapshot() {
     const wb = requireWorkbook();
+    const mapping = resolveMapping(await loadSavedMapping(), wb.headers);
+    const errors = validateMapping(mapping, wb.headers);
+    if (errors.length) throw new AppError(400, 'INVALID_MAPPING', errors.join(' '), { errors });
+    return { wb, mapping, mappingVersion: mappingVersionOf(mapping) };
+  }
+
+  const STALE_MESSAGE =
+    'Another team member uploaded a different workbook or changed the column mapping after you selected this attorney. ' +
+    'No email was sent. Please reload the page and select the attorney again.';
+  const stale = (reason) => new AppError(409, 'STALE_SELECTION', STALE_MESSAGE, { reason });
+
+  /** Is the client's selection still for this workbook and mapping? (versions only) */
+  function assertVersions(expected, wb, mappingVersion) {
+    if (expected?.workbookVersion !== wb.version) throw stale('workbook');
+    if (expected?.mappingVersion !== mappingVersion) throw stale('mapping');
+  }
+
+  /**
+   * Verify that what the user selected (and previewed) is still exactly this
+   * attorney and recipient in the current workbook and mapping.
+   */
+  function assertSelection(expected, wb, mappingVersion, values) {
+    if (!isPlainObject(expected) || ['workbookVersion', 'mappingVersion', 'recordId', 'recipientEmail'].some((k) => typeof expected[k] !== 'string')) {
+      throw stale('missing');
+    }
+    assertVersions(expected, wb, mappingVersion);
+    if (normalizeId(recordIdentity(values).recordId) !== normalizeId(expected.recordId)) throw stale('record');
+    if (normalizeEmail(values.get('recipientEmail')) !== normalizeEmail(expected.recipientEmail)) throw stale('recipient');
+  }
+
+  function findRow(rowNumber, wb = requireWorkbook()) {
     const n = Number(rowNumber);
     if (!Number.isInteger(n) || n < 1) throw new AppError(400, 'INVALID_ROW', 'Please select an attorney.');
     const row = wb.rows.find((r) => r.rowNumber === n);
@@ -305,6 +339,8 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       historyError: null,
       placeholders: listPlaceholders(workbook.headers),
       totalRecords: workbook.rows.length,
+      workbookVersion: workbook.version,
+      mappingVersion: mappingVersionOf(mapping),
       records: null,
     };
     if (mappingErrors.length) return base;
@@ -397,7 +433,9 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
         const fileName = path.basename(req.file.originalname || 'workbook.xlsx').slice(0, 200);
         validateExcelFile(fileName, req.file.buffer);
         const parsed = parseWorkbook(req.file.buffer);
-        workbook = { ...parsed, fileName, uploadedAt: new Date().toISOString(), derived: null };
+        // A new version for every upload (even of the same file): selections made
+        // against an earlier upload are then recognised as stale.
+        workbook = { ...parsed, fileName, uploadedAt: new Date().toISOString(), derived: null, version: crypto.randomUUID() };
         ok(res, await workbookPayload());
       } catch (e) {
         next(e);
@@ -442,15 +480,19 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
   });
 
   // ---- Compose / preview -------------------------------------------------------
-  async function buildEmailForRow(rowNumber) {
-    const mapping = await requireValidMapping();
-    const row = findRow(rowNumber);
-    const values = getRecordValues(row, workbook.headers, mapping);
+  async function buildEmailForRow(rowNumber, expected) {
+    const { wb, mapping, mappingVersion } = await snapshot();
+    // The attorney list the user clicked on must still be the current one.
+    if (expected?.workbookVersion !== undefined || expected?.mappingVersion !== undefined) assertVersions(expected, wb, mappingVersion);
+    const row = findRow(rowNumber, wb);
+    const values = getRecordValues(row, wb.headers, mapping);
     const { template } = await templates.load();
     const rendered = renderEmail(template, values);
     const identity = recordIdentity(values);
     return {
-      recordNumber: workbook.rows.indexOf(row) + 1,
+      workbookVersion: wb.version,
+      mappingVersion,
+      recordNumber: wb.rows.indexOf(row) + 1,
       rowNumber: row.rowNumber,
       attorneyName: values.get('attorneyName'),
       registrationNumber: values.get('registrationNumber'),
@@ -465,13 +507,14 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     };
   }
 
-  app.post('/api/preview', async (req, res) => ok(res, await buildEmailForRow(req.body?.rowNumber)));
+  app.post('/api/preview', async (req, res) => ok(res, await buildEmailForRow(req.body?.rowNumber, req.body)));
 
   // ---- History -------------------------------------------------------------------
   app.post('/api/history/check', async (req, res) => {
-    const mapping = await requireValidMapping();
-    const row = findRow(req.body?.rowNumber);
-    const values = getRecordValues(row, workbook.headers, mapping);
+    const { wb, mapping, mappingVersion } = await snapshot();
+    const row = findRow(req.body?.rowNumber, wb);
+    const values = getRecordValues(row, wb.headers, mapping);
+    if (req.body?.expected !== undefined) assertSelection(req.body.expected, wb, mappingVersion, values);
     const identity = recordIdentity(values);
     const { exact, possible } = matchHistory(await history.entriesInOrder(), identity, values);
     ok(res, {
@@ -492,7 +535,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
 
   // ---- Send -----------------------------------------------------------------------
   app.post('/api/send', async (req, res) => {
-    const { rowNumber, subject, body, confirmResend, requestId } = req.body || {};
+    const { rowNumber, subject, body, confirmResend, requestId, expected } = req.body || {};
     if (typeof requestId !== 'string' || !REQUEST_ID_RE.test(requestId)) throw new AppError(400, 'INVALID_REQUEST', 'Invalid send request. Please reload the page.');
 
     // Idempotency: the same request ID never sends twice.
@@ -501,9 +544,12 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     if (existing?.status === 'pending') throw new AppError(409, 'SEND_IN_PROGRESS', 'This email is already being sent. Please wait.');
     if (existing?.status === 'done') return ok(res, { ...existing.response, repeatedRequest: true });
 
-    const mapping = await requireValidMapping();
-    const row = findRow(rowNumber);
-    const values = getRecordValues(row, workbook.headers, mapping);
+    const { wb, mapping, mappingVersion } = await snapshot();
+    const row = findRow(rowNumber, wb);
+    const values = getRecordValues(row, wb.headers, mapping);
+    // The recipient comes from the server's copy of the workbook. Make sure it is
+    // still exactly the attorney and address the user selected and previewed.
+    assertSelection(expected, wb, mappingVersion, values);
     const identity = recordIdentity(values);
     const { recordId } = identity;
     const to = values.get('recipientEmail');
@@ -523,6 +569,10 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     // see the latest history.
     await sendMutex.run(async () => {
     try {
+      // Re-check after waiting for other team members' sends: the workbook or
+      // mapping may have been replaced in the meantime.
+      if (workbook !== wb) throw stale('workbook');
+      if (mappingVersionOf(resolveMapping(await loadSavedMapping(), wb.headers)) !== mappingVersion) throw stale('mapping');
       const { exact, possible } = matchHistory(await history.entriesInOrder(), identity, values);
       if (exact.length && confirmResend !== true) {
         throw new AppError(409, 'ALREADY_SENT', 'This attorney has already received an email.', { previous: exact.reverse(), recordId, idType: identity.idType });
