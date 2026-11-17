@@ -68,7 +68,8 @@ export function matchHistory(entries, identity, values) {
   const email = normalizeEmail(values.get('recipientEmail'));
   const name = normalizeText(values.get('attorneyName'));
   for (const e of entries) {
-    if (!countsAsSent(e.status)) continue;
+    // Failed sends and voided (corrected) records never count as "already sent".
+    if (!countsAsSent(e.status) || e.voided) continue;
     if (normalizeId(e.recordId) === id) {
       exact.push(e);
       continue;

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
+import { whenOf } from '../time.js';
 import { Alert, Card, Modal, Pager, Spinner, StatusBadge, Toast } from './ui.jsx';
 import { clipboardText, copiedMessage, labelFor, manualCopyMessage, queuedCopy, sessionSentNames } from '../sentNames.js';
 
@@ -333,7 +334,7 @@ function RecordsCard({ workbook, view, setView, busy, selectedRow, onSelect }) {
                   {r.problems?.length ? (
                     <span className="badge badge-warn" title={r.problems.join(', ')}>{r.problems[0]}</span>
                   ) : r.sentCount ? (
-                    <span className="badge badge-sent">Sent{r.sentCount > 1 ? ` ×${r.sentCount}` : ''}</span>
+                    <span className="badge badge-sent">{r.sentInfo?.lastMethod === 'Manual' ? 'Sent (manual)' : `Sent${r.sentCount > 1 ? ` ×${r.sentCount}` : ''}`}</span>
                   ) : r.possiblySent ? (
                     <span className="badge badge-warn" title="An email to this address is already in the sending history under a different record.">Possibly sent</span>
                   ) : r.sentCount === 0 ? (
@@ -565,7 +566,7 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onConfirm
               <tbody>
                 {previous.map((p, i) => (
                   <tr key={i}>
-                    <td className="nowrap">{p.sentAt}</td>
+                    <td className="nowrap">{whenOf(p)}{p.sendMethod === 'Manual' && <span className="sub-line">Marked as sent manually{p.operator ? ` by ${p.operator}` : ''}</span>}</td>
                     {stage === 'possible' && <td>{p.attorneyName}{p.firmName && <span className="sub-line">{p.firmName}</span>}</td>}
                     <td className="email-cell">{p.recipientEmail}</td>
                     <td><StatusBadge status={p.status} />{p.pendingSave ? ' (not yet in Excel)' : ''}</td>

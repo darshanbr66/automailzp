@@ -82,8 +82,8 @@ export function makeMailer(fake, config = testConfig()) {
 }
 
 /** Start the app on a random port and return a small client with a cookie jar. */
-export async function startTestServer({ dataDir, mailer, config = testConfig() }) {
-  const app = createApp({ config, dataDir, mailer });
+export async function startTestServer({ dataDir, mailer, config = testConfig(), storage, headers: defaultHeaders = {} }) {
+  const app = createApp({ config, dataDir, mailer, ...(storage ? { storage } : {}) });
   const server = await new Promise((resolve) => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
   });
@@ -105,7 +105,7 @@ export async function startTestServer({ dataDir, mailer, config = testConfig() }
 
   async function request(method, urlPath, { json, form, headers = {}, csrf = true, select = true } = {}) {
     if (select && method === 'POST' && (urlPath === '/api/send' || urlPath === '/api/history/check')) json = await withSelection(json);
-    const h = { ...headers };
+    const h = { ...defaultHeaders, ...headers };
     if (cookie) h.cookie = cookie;
     if (csrf && method !== 'GET') h['x-oea-request'] = '1';
     let body;

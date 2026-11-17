@@ -3,14 +3,16 @@ import express from 'express';
 import multer from 'multer';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
-import { AppError, Mutex, isPlainObject, normalizeId, readJsonFile, writeJsonFile, formatDateTime } from './utils.js';
+import { AppError, Mutex, isPlainObject, normalizeId, formatDateTime } from './utils.js';
 import { FileSessionStore, LoginLimiter, parseCookies, safeEqual, sessionCookie, verifyPassword } from './auth.js';
 import {
   MAPPING_FIELDS, MAX_UPLOAD_BYTES, getRecordValues, listPlaceholders, parseWorkbook,
   resolveMapping, sanitizeMapping, validateExcelFile, validateMapping,
 } from './excel.js';
-import { DEFAULT_TEMPLATE, TemplateStore, renderEmail } from './template.js';
-import { HistoryStore } from './history.js';
+import { DEFAULT_TEMPLATE, renderEmail } from './template.js';
+import { buildHistoryWorkbookBuffer } from './history.js';
+import { createFileStorage } from './storage/file.js';
+import { auditContext, requireOperator } from './audit.js';
 import { isValidEmail, validateMessage } from './email.js';
 import { providerLabel } from './mailer.js';
 import { countsAsSent, matchHistory, normalizeEmail, normalizeText, recordIdentity } from './identity.js';
@@ -29,21 +31,27 @@ const MAX_QUERY = 200;
  * @param {string} deps.dataDir      directory for template, mapping and history files
  * @param {import('./email.js').SmtpMailer|null} deps.mailer  null when SMTP is not configured
  * @param {object} [deps.loginLimiter]  replaced in tests
+ * @param {object} [deps.storage]  file storage (default) or MongoDB storage (src/storage)
  */
-export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLimiter() }) {
+export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLimiter(), storage = createFileStorage(dataDir) }) {
   const app = express();
-  const templates = new TemplateStore(dataDir);
-  const history = new HistoryStore(dataDir);
-  const settingsPath = path.join(dataDir, 'settings.json');
+  const history = storage.history;
+  const templates = storage.templates;
+  const persistent = Boolean(storage.features.persistentWorkbook);
+  const teamMembers = config.teamMembers || ['Team Member 1', 'Team Member 2'];
+  const auditOpts = { teamMembers, clientIpHops: config.clientIpHops ?? 0 };
+  /** Who/where/what for the activity log (collected here, from the request). */
+  const ctxOf = (req) => auditContext(req, auditOpts);
+  /** Operator for audited actions: required when the shared database is used. */
+  const operatorFor = (req) => (storage.features.operatorRequired ? requireOperator(req, teamMembers) : ctxOf(req).operator);
 
-  // Attorney data lives only in memory; it is never written to disk. It is
-  // shared by everyone signed in: uploading a workbook replaces it for the team.
+  // The uploaded workbook, shared by everyone signed in: uploading a workbook
+  // replaces it for the team. File storage keeps it in memory only; MongoDB
+  // storage persists it and this is a cache that follows the shared version.
   let workbook = null;
   // One send at a time across the whole team: the duplicate check, the SMTP send
   // and the history write happen as one serialized step (single service instance).
   const sendMutex = new Mutex();
-  const settingsMutex = new Mutex();
-  const sendingRecords = new Set(); // normalized record IDs currently being sent
   const sendRequests = new Map(); // requestId -> { status, response, at }
   let lastSmtpTest = null; // { ok, at, message, code }
   let smtpTestRunning = null;
@@ -59,7 +67,8 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     sweep.unref();
   }
   const envWhere = config.isProduction ? 'the Render environment variables' : 'backend/.env (see README)';
-  const historyFileLabel = config.isProduction && config.explicitDataDir ? path.posix.join(dataDir, 'sent-emails.xlsx') : 'backend/data/sent-emails.xlsx';
+  const historyFileLabel =
+    storage.kind === 'file' ? (config.isProduction && config.explicitDataDir ? path.posix.join(dataDir, 'sent-emails.xlsx') : 'backend/data/sent-emails.xlsx') : storage.historyLabel;
 
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy ?? false);
@@ -112,7 +121,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     if (req.method === 'OPTIONS') {
       if (!allowed) return res.status(403).end();
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-OEA-Request, X-CSRF-Token');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-OEA-Request, X-CSRF-Token, X-Operator');
       res.setHeader('Access-Control-Max-Age', '600');
       return res.status(204).end();
     }
@@ -204,12 +213,23 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
   const ok = (res, data, status = 200) => res.status(status).json({ ok: true, data });
 
   async function loadSavedMapping() {
-    try {
-      const s = await readJsonFile(settingsPath);
-      return isPlainObject(s?.mapping) ? sanitizeMapping(s.mapping) : null;
-    } catch {
-      return null;
-    }
+    return storage.mappings.load();
+  }
+
+  /**
+   * MongoDB storage: make sure this process uses the workbook the team currently
+   * shares (another team member, or another server process, may have replaced it).
+   */
+  async function syncWorkbook() {
+    if (!persistent) return;
+    const version = await storage.workbooks.currentVersion();
+    if (version === (workbook?.version ?? null)) return;
+    workbook = version ? await storage.workbooks.loadCurrent() : null;
+  }
+
+  /** The workbook version this request must still match (from the shared store when persistent). */
+  async function liveWorkbookVersion() {
+    return persistent ? storage.workbooks.currentVersion() : workbook?.version ?? null;
   }
 
   async function currentMapping() {
@@ -233,6 +253,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
    * member can't mix rows from one workbook with the mapping of another.
    */
   async function snapshot() {
+    await syncWorkbook();
     const wb = requireWorkbook();
     const mapping = resolveMapping(await loadSavedMapping(), wb.headers);
     const errors = validateMapping(mapping, wb.headers);
@@ -324,6 +345,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
    * render every row.
    */
   async function workbookPayload({ q = '', page = 1 } = {}) {
+    await syncWorkbook();
     if (!workbook) return { loaded: false, fields: MAPPING_FIELDS.map(({ hints, ...f }) => f), mapping: await currentMapping(), placeholders: listPlaceholders() };
     const mapping = await currentMapping();
     const mappingErrors = validateMapping(mapping, workbook.headers);
@@ -347,18 +369,29 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
 
     let sentCounts = null;
     let sentEmails = null;
+    let sentInfo = null;
     try {
       sentCounts = new Map();
       sentEmails = new Set();
+      sentInfo = new Map();
       for (const e of await history.entriesInOrder()) {
-        if (!countsAsSent(e.status)) continue;
+        if (!countsAsSent(e.status) || e.voided) continue;
         const id = normalizeId(e.recordId);
         sentCounts.set(id, (sentCounts.get(id) || 0) + 1);
         if (e.recipientEmail) sentEmails.add(normalizeEmail(e.recipientEmail));
+        const info = sentInfo.get(id) || { uncertain: 0, manual: 0 };
+        if (e.status === 'Uncertain') info.uncertain += 1;
+        if (e.sendMethod === 'Manual') info.manual += 1;
+        info.lastMethod = e.sendMethod || '';
+        info.lastAtUtc = e.sentAtUtc || null;
+        info.lastAt = e.sentAt || '';
+        info.lastOperator = e.operator || '';
+        sentInfo.set(id, info);
       }
     } catch (err) {
       sentCounts = null;
       sentEmails = null;
+      sentInfo = null;
       base.historyError = err instanceof AppError ? err.message : 'Could not read the sending history.';
     }
 
@@ -370,7 +403,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     const rows = matches.slice((current - 1) * PAGE_SIZE, current * PAGE_SIZE).map(({ search, ...r }) => {
       const sentCount = sentCounts ? sentCounts.get(normalizeId(r.recordId)) || 0 : null;
       const possiblySent = Boolean(sentEmails && !sentCount && r.idType === 'fallback' && r.recipientEmail && sentEmails.has(normalizeEmail(r.recipientEmail)));
-      return { ...r, sentCount, possiblySent };
+      return { ...r, sentCount, possiblySent, sentInfo: sentInfo?.get(normalizeId(r.recordId)) || null };
     });
     base.records = { query: q, page: current, pageSize: PAGE_SIZE, pageCount, matched: matches.length, rows };
     return base;
@@ -391,6 +424,17 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       lastTest: lastSmtpTest,
     };
   }
+
+  // App capabilities for the frontend (no secrets: never the connection string).
+  app.get('/api/app/config', (req, res) => {
+    ok(res, {
+      storage: storage.kind,
+      features: storage.features,
+      teamMembers,
+      operatorIdentification: 'self-declared',
+      historyLabel: historyFileLabel,
+    });
+  });
 
   app.get('/api/status', (req, res) => {
     ok(res, { app: 'outlook-email-automation', smtpConfigured: Boolean(mailer), configProblems: config.problems, workbookLoaded: Boolean(workbook) });
@@ -433,9 +477,18 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
         const fileName = path.basename(req.file.originalname || 'workbook.xlsx').slice(0, 200);
         validateExcelFile(fileName, req.file.buffer);
         const parsed = parseWorkbook(req.file.buffer);
+        const operator = operatorFor(req);
         // A new version for every upload (even of the same file): selections made
         // against an earlier upload are then recognised as stale.
-        workbook = { ...parsed, fileName, uploadedAt: new Date().toISOString(), derived: null, version: crypto.randomUUID() };
+        const wb = { ...parsed, fileName, uploadedAt: new Date().toISOString(), derived: null, version: crypto.randomUUID(), uploadedBy: operator };
+        await storage.workbooks.save(wb, { operator }); // MongoDB: stored and shared before anyone uses it
+        workbook = wb;
+        await storage.activity.record({
+          action: 'workbook_uploaded',
+          summary: `Uploaded workbook "${fileName}" (${wb.rows.length} attorneys), replacing the previous one for the team`,
+          ctx: ctxOf(req),
+          details: { fileName, sheetName: wb.sheetName, rows: wb.rows.length, workbookVersion: wb.version },
+        });
         ok(res, await workbookPayload());
       } catch (e) {
         next(e);
@@ -445,37 +498,45 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
 
   app.get('/api/excel/records', async (req, res) => ok(res, await workbookPayload(parsePaging(req.query))));
 
-  app.delete('/api/excel', (req, res) => {
+  app.delete('/api/excel', async (req, res) => {
+    operatorFor(req);
+    await storage.workbooks.clear();
     workbook = null;
+    await storage.activity.record({ action: 'workbook_removed', summary: 'Removed the shared workbook', ctx: ctxOf(req) });
     ok(res, { loaded: false });
   });
 
   // ---- Column mapping ----------------------------------------------------------
   app.get('/api/mapping', async (req, res) => {
+    await syncWorkbook();
     ok(res, { fields: MAPPING_FIELDS.map(({ hints, ...f }) => f), mapping: await currentMapping(), saved: await loadSavedMapping() });
   });
 
   app.put('/api/mapping', async (req, res) => {
     const mapping = sanitizeMapping(req.body?.mapping);
+    const operator = operatorFor(req);
+    await syncWorkbook();
     if (workbook) {
       const errors = validateMapping(mapping, workbook.headers);
       if (errors.length) throw new AppError(400, 'INVALID_MAPPING', errors.join(' '), { errors });
     }
-    await settingsMutex.run(async () => {
-      const settings = (await readJsonFile(settingsPath).catch(() => null)) || {};
-      await writeJsonFile(settingsPath, { ...(isPlainObject(settings) ? settings : {}), mapping });
-    });
+    const before = await loadSavedMapping();
+    await storage.mappings.save(mapping, { operator });
+    await storage.activity.record({ action: 'mapping_updated', summary: 'Updated the column mapping', ctx: ctxOf(req), details: { before, after: mapping } });
     ok(res, await workbookPayload());
   });
 
   // ---- Template ------------------------------------------------------------------
   app.get('/api/template', async (req, res) => {
+    await syncWorkbook();
     const { template, warning } = await templates.load();
     ok(res, { template, defaultTemplate: DEFAULT_TEMPLATE, placeholders: listPlaceholders(workbook?.headers), warning: warning || null });
   });
 
   app.put('/api/template', async (req, res) => {
-    const template = await templates.save(req.body?.template);
+    const operator = operatorFor(req);
+    const template = await templates.save(req.body?.template, { operator });
+    await storage.activity.record({ action: 'template_updated', summary: 'Updated the email template', ctx: ctxOf(req), details: { subject: template.subject } });
     ok(res, { template });
   });
 
@@ -556,12 +617,17 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     validateMessage({ to, subject, body });
 
     if (!mailer) throw new AppError(503, 'SMTP_NOT_CONFIGURED', `Email sending is not configured yet. Add the Hostinger SMTP settings and App Password to ${envWhere} and restart the app.`);
+    const operator = operatorFor(req);
+    const ctx = ctxOf(req);
 
     // The sender is whatever mailbox the environment configured at start-up.
     const senderEmail = mailer.publicInfo().from;
-    const lockKey = normalizeId(recordId);
-    if (sendingRecords.has(lockKey)) throw new AppError(409, 'SEND_IN_PROGRESS', 'An email to this attorney is already being sent. Please wait.');
-    sendingRecords.add(lockKey);
+    const sendMethod = mailer.publicInfo().provider === 'resend' ? 'Resend' : 'SMTP';
+    const draft = (status, sendType) => historyEntry({ identity, values, subject, senderEmail, status, sendType, sendMethod, operator, requestId, workbookId: wb.version });
+    // Claim this attorney (and, with MongoDB, this address) for this send. With
+    // MongoDB the claim is shared by every server process; if the server stops
+    // mid-send, the claim is later recorded as "Uncertain".
+    const claim = await storage.locks.acquire({ recordKey: recordId, emailKey: to, requestId, kind: 'send', entry: draft('Uncertain', '') });
     sendRequests.set(requestId, { status: 'pending', at: Date.now() });
     let sendType = 'First Send';
     let attempted = false;
@@ -571,7 +637,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     try {
       // Re-check after waiting for other team members' sends: the workbook or
       // mapping may have been replaced in the meantime.
-      if (workbook !== wb) throw stale('workbook');
+      if (workbook !== wb || (persistent && (await liveWorkbookVersion()) !== wb.version)) throw stale('workbook');
       if (mappingVersionOf(resolveMapping(await loadSavedMapping(), wb.headers)) !== mappingVersion) throw stale('mapping');
       const { exact, possible } = matchHistory(await history.entriesInOrder(), identity, values);
       if (exact.length && confirmResend !== true) {
@@ -593,9 +659,18 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       const sent = await mailer.send({ to, subject, body, idempotencyKey: `zp-send-${requestId}` });
       if (lastSmtpTest && !lastSmtpTest.ok && lastSmtpTest.code === 'SMTP_AUTH_FAILED') lastSmtpTest = null;
 
-      const entry = historyEntry({ identity, values, subject, senderEmail, status: 'Success', sendType });
-      console.log(`[send] Email accepted by the SMTP server (${entry.sendType}, row ${row.rowNumber})`);
+      const entry = { ...draft('Success', sendType), messageId: sent.messageId || null };
+      console.log(`[send] Email accepted by the ${sendMethod} service (${entry.sendType}, row ${row.rowNumber})`);
       const saved = await history.append(entry);
+      const activityId = await storage.activity.record({
+        action: 'email_sent',
+        summary: `Sent an email via ${sendMethod} (${sendType})`,
+        ctx,
+        attorney: entry,
+        historyId: saved.id,
+        details: { sendMethod, sendType, messageId: sent.messageId || null, subject: entry.subject },
+      });
+      if (saved.id && activityId) await storage.activity.link?.(activityId, saved.id);
       const response = {
         accepted: true,
         message: `${providerLabel(mailer.publicInfo().provider)} accepted the email for delivery to ${to}.`,
@@ -613,17 +688,28 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
         // Record the failed attempt. It is never marked as a success and, unless
         // the outcome is uncertain, does not count as "already sent".
         const status = err?.code === 'SMTP_UNCERTAIN' ? 'Uncertain' : 'Failed';
-        const saved = await history.append(historyEntry({ identity, values, subject, senderEmail, status, sendType }));
+        const failed = draft(status, sendType);
+        const saved = await history.append(failed);
         if (!saved.saved) console.error('[history] Could not record the failed send attempt');
+        await storage.activity.record({
+          action: status === 'Uncertain' ? 'email_uncertain' : 'email_failed',
+          summary: `${status === 'Uncertain' ? 'Send outcome uncertain' : 'Send failed'} via ${sendMethod}`,
+          outcome: status.toLowerCase(),
+          ctx,
+          attorney: failed,
+          historyId: saved.id,
+          details: { sendMethod, sendType, errorCode: err?.code || null },
+        });
       }
       throw err;
     } finally {
-      sendingRecords.delete(lockKey);
+      await claim.release();
     }
     });
   });
 
-  function historyEntry({ identity, values, subject, senderEmail, status, sendType }) {
+  function historyEntry({ identity, values, subject, senderEmail, status, sendType, sendMethod = '', operator = null, requestId = null, workbookId = null, note = '' }) {
+    const now = new Date();
     return {
       recordId: identity.recordId,
       registrationNumber: values.get('registrationNumber') || '',
@@ -633,12 +719,180 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       city: values.get('city') || '',
       state: values.get('state') || '',
       subject: String(subject).trim(),
-      sentAt: formatDateTime(),
+      sentAt: formatDateTime(now),
+      sentAtUtc: now.toISOString(),
       senderEmail,
       status,
       sendType,
+      sendMethod,
+      operator: operator || '',
+      requestId,
+      workbookId,
+      note,
     };
   }
+
+  // ---- Shared views: Sent Emails, statistics, team activity -----------------------
+  const isSent = (e) => e.status === 'Success' && !e.voided;
+  const methodOf = (e) => e.sendMethod || 'Unknown';
+  function safeTimeZone(tz) {
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: tz });
+      return tz;
+    } catch {
+      return 'UTC';
+    }
+  }
+  /** Calendar day of an entry in the viewer's time zone ("YYYY-MM-DD"). */
+  function dayOf(e, tz) {
+    if (e.sentAtUtc) return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(e.sentAtUtc));
+    return String(e.sentAt || '').slice(0, 10); // legacy row without a UTC timestamp
+  }
+
+  app.get('/api/sent', async (req, res) => {
+    const tz = safeTimeZone(String(req.query.tz || 'UTC'));
+    const q = normalizeText(String(req.query.q || '').slice(0, MAX_QUERY));
+    const method = String(req.query.method || '');
+    const operator = String(req.query.operator || '');
+    const from = String(req.query.from || '');
+    const to = String(req.query.to || '');
+    const pageSize = Math.min(50, Math.max(5, Number.parseInt(req.query.pageSize, 10) || 20));
+    const all = (await history.readAll()).filter(isSent);
+    const items = all.filter((e) => {
+      if (method && methodOf(e) !== method) return false;
+      if (operator && (e.operator || '') !== operator) return false;
+      const day = dayOf(e, tz);
+      if (from && day < from) return false;
+      if (to && day > to) return false;
+      if (q && !normalizeText([e.attorneyName, e.recipientEmail, e.registrationNumber].join(' ')).includes(q)) return false;
+      return true;
+    });
+    const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+    const page = Math.min(Math.max(1, Number.parseInt(req.query.page, 10) || 1), pageCount);
+    ok(res, {
+      total: items.length,
+      page,
+      pageSize,
+      pageCount,
+      items: items.slice((page - 1) * pageSize, page * pageSize),
+      methods: [...new Set(all.map(methodOf))].sort(),
+      operators: [...new Set(all.map((e) => e.operator).filter(Boolean))].sort(),
+    });
+  });
+
+  app.get('/api/stats', async (req, res) => {
+    const tz = safeTimeZone(String(req.query.tz || 'UTC'));
+    const entries = await history.entriesInOrder();
+    const sent = entries.filter(isSent);
+    const byOperator = new Map();
+    const bump = (name, key) => {
+      const k = name || '(not recorded)';
+      const o = byOperator.get(k) || { operator: k, sent: 0, manual: 0, failed: 0, uncertain: 0 };
+      o[key] += 1;
+      byOperator.set(k, o);
+    };
+    for (const e of entries) {
+      if (e.voided) continue;
+      if (e.status === 'Success') bump(e.operator, e.sendMethod === 'Manual' ? 'manual' : 'sent');
+      else if (e.status === 'Failed') bump(e.operator, 'failed');
+      else if (e.status === 'Uncertain') bump(e.operator, 'uncertain');
+    }
+    const daily = new Map();
+    for (const e of sent) {
+      const d = dayOf(e, tz);
+      if (d) daily.set(d, (daily.get(d) || 0) + 1);
+    }
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+    ok(res, {
+      timeZone: tz,
+      totalSent: sent.length,
+      manual: sent.filter((e) => e.sendMethod === 'Manual').length,
+      resend: sent.filter((e) => e.sendMethod === 'Resend').length,
+      smtp: sent.filter((e) => e.sendMethod === 'SMTP').length,
+      unknownMethod: sent.filter((e) => !e.sendMethod).length,
+      failed: entries.filter((e) => e.status === 'Failed' && !e.voided).length,
+      uncertain: entries.filter((e) => e.status === 'Uncertain' && !e.voided).length,
+      voided: entries.filter((e) => e.voided).length,
+      today: daily.get(today) || 0,
+      daily: [...daily.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1)).slice(0, 30).map(([date, count]) => ({ date, count })),
+      byOperator: [...byOperator.values()].sort((a, b) => b.sent + b.manual - (a.sent + a.manual)),
+      inProgress: storage.locks.list ? await storage.locks.list() : [],
+    });
+  });
+
+  app.get('/api/activity', async (req, res) => {
+    if (!storage.features.activity) return ok(res, { available: false, items: [], total: 0, page: 1, pageCount: 1 });
+    const pageSize = 20;
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const r = await storage.activity.list({ page, pageSize, q: String(req.query.q || '').slice(0, MAX_QUERY), action: String(req.query.action || ''), operator: String(req.query.operator || '') });
+    ok(res, { available: true, ...r, page, pageCount: Math.max(1, Math.ceil(r.total / pageSize)) });
+  });
+
+  // ---- All Attorneys: manual "Mark as sent" (MongoDB) --------------------------------
+  app.post('/api/attorneys/mark-sent', async (req, res) => {
+    if (!storage.features.manualMarking) throw new AppError(400, 'NOT_AVAILABLE', 'Marking attorneys as sent requires the shared database (MongoDB).');
+    const { rowNumber, expected, note, confirmPossible } = req.body || {};
+    const operator = requireOperator(req, teamMembers);
+    const ctx = ctxOf(req);
+    const noteText = typeof note === 'string' ? note.replace(/\s+/g, ' ').trim().slice(0, 500) : '';
+    const { wb, mapping, mappingVersion } = await snapshot();
+    const row = findRow(rowNumber, wb);
+    const values = getRecordValues(row, wb.headers, mapping);
+    assertSelection(expected, wb, mappingVersion, values);
+    const identity = recordIdentity(values);
+    const requestId = `manual-${crypto.randomUUID()}`;
+    const entry = historyEntry({ identity, values, subject: '(contacted outside the app)', senderEmail: '', status: 'Success', sendType: 'First Send', sendMethod: 'Manual', operator, requestId, workbookId: wb.version, note: noteText });
+    const claim = await storage.locks.acquire({ recordKey: identity.recordId, emailKey: values.get('recipientEmail'), requestId, kind: 'manual' });
+    await sendMutex.run(async () => {
+      try {
+        if ((await liveWorkbookVersion()) !== wb.version) throw stale('workbook');
+        if (mappingVersionOf(resolveMapping(await loadSavedMapping(), wb.headers)) !== mappingVersion) throw stale('mapping');
+        const { exact, possible } = matchHistory(await history.entriesInOrder(), identity, values);
+        if (exact.length) {
+          throw new AppError(409, 'ALREADY_SENT', 'This attorney is already recorded as sent. It was not marked again.', { previous: exact.reverse() });
+        }
+        if (possible.length && confirmPossible !== true) {
+          throw new AppError(409, 'POSSIBLE_DUPLICATE', 'An email to this address is already in the history under a different record.', { possible: possible.reverse() });
+        }
+        const saved = await history.append(entry);
+        if (!saved.saved) throw new AppError(503, 'DB_UNAVAILABLE', 'The shared database could not be updated. The attorney was not marked as sent; please try again.');
+        const activityId = await storage.activity.record({ action: 'manual_mark_sent', summary: 'Marked as sent manually (contacted outside the app)', ctx, attorney: entry, historyId: saved.id, details: { note: noteText } });
+        if (saved.id && activityId) await storage.activity.link?.(activityId, saved.id);
+        ok(res, { entry: { ...entry, id: saved.id } });
+      } finally {
+        await claim.release();
+      }
+    });
+  });
+
+  // ---- Audited corrections (never deletes history) -------------------------------------
+  app.post('/api/history/:id/correct', async (req, res) => {
+    if (!storage.features.corrections) throw new AppError(400, 'NOT_AVAILABLE', 'Corrections require the shared database (MongoDB).');
+    const operator = requireOperator(req, teamMembers);
+    const action = String(req.body?.action || '');
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.replace(/\s+/g, ' ').trim().slice(0, 500) : '';
+    if (reason.length < 3) throw new AppError(400, 'REASON_REQUIRED', 'Please give a short reason for the correction (it is kept in the activity log).');
+    const result = await sendMutex.run(() => history.correct(req.params.id, { action, reason, operator }));
+    const labels = { void: 'Voided a history record', 'confirm-sent': 'Confirmed an uncertain send as sent', 'confirm-not-sent': 'Confirmed an uncertain send as not sent' };
+    await storage.activity.record({
+      action: 'history_corrected',
+      summary: labels[action] || 'Corrected a history record',
+      ctx: ctxOf(req),
+      attorney: result.before,
+      historyId: req.params.id,
+      details: { correction: action, reason, before: { status: result.before.status, voided: result.before.voided }, after: { status: result.after.status, voided: result.after.voided } },
+    });
+    ok(res, { entry: result.after });
+  });
+
+  // ---- Excel export of the sending history (both storage modes) ------------------------
+  app.get('/api/history/export', async (req, res) => {
+    const buffer = buildHistoryWorkbookBuffer(await history.entriesInOrder());
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="sent-history-${stamp}.xlsx"`);
+    res.send(buffer);
+  });
 
   // ---- Errors ---------------------------------------------------------------------
   app.use('/api', (req, res) => res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Not found' } }));
