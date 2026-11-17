@@ -7,8 +7,9 @@ export class ApiError extends Error {
   }
 }
 
-// Hosted (Vercel): VITE_API_BASE_URL=https://api.zodiacpatent.com, set at build time.
-// Local: empty, so requests go to /api on the Vite dev server, which proxies them.
+// Normally empty: requests go to /api on the app's own address. On Vercel the
+// rewrite in vercel.json forwards them to Render; locally the Vite dev server
+// proxies them. (Optional VITE_API_BASE_URL is only for a same-site API origin.)
 export const API_BASE = String(import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 
 const UNREACHABLE = API_BASE

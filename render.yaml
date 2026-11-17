@@ -25,10 +25,18 @@ services:
         value: production
       - key: NODE_VERSION
         value: "20"
+      # The browser only talks to the Vercel site; Vercel forwards /api/* here
+      # (frontend/vercel.json). The browser's Origin is therefore the Vercel site.
       - key: FRONTEND_URL
-        value: https://app.zodiacpatent.com
+        value: https://automailzp.vercel.app
+      # Host names accepted on incoming requests (Render's own *.onrender.com
+      # name is also added automatically). The Vercel name is listed in case the
+      # proxy passes the original Host header through.
       - key: ALLOWED_HOSTS
-        value: api.zodiacpatent.com
+        value: automailzp.onrender.com,automailzp.vercel.app
+      # Trust exactly ONE proxy hop: Render's own load balancer, which records the
+      # address that actually connected. Higher values would let anyone who calls
+      # the Render URL directly forge X-Forwarded-For and dodge the login limiter.
       - key: TRUST_PROXY
         value: "1"
       # Shared team login

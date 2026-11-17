@@ -190,16 +190,14 @@ Check `https://<service-name>.onrender.com/healthz`. It should return `{"ok":tru
 
 1. Vercel → **Add New… → Project** → import the GitHub repository.
 2. **Root Directory: `frontend`**. Vercel detects Vite. `frontend/vercel.json` sets the build command (`npm run build`), the output folder (`dist`) and the security headers.
-3. **Environment Variables** → add, for **Production**:
-
-   | Name | Value |
-   |---|---|
-   | `VITE_API_BASE_URL` | `https://api.zodiacpatent.com` |
-
-   This is the **only** variable Vercel needs. It's public (it's baked into the JavaScript), so never add SMTP or login values to Vercel.
+3. **Environment Variables: none.** In particular, **don't set `VITE_API_BASE_URL` or `VITE_API_URL`**. Delete them if they exist. The app calls `/api/...` on its own address (`https://automailzp.vercel.app`), and the first rewrite in `frontend/vercel.json` forwards those requests to `https://automailzp.onrender.com/api/...`. Never add SMTP or login values to Vercel.
 4. **Deploy**.
 
-> Vercel *preview* deployments (`*.vercel.app` URLs) can load the page but **can't sign in**, because the API only accepts requests from `https://app.zodiacpatent.com`. That's intentional.
+**Why a proxy:** `automailzp.vercel.app` and `automailzp.onrender.com` count as different sites to browsers, so a login cookie set by Render directly would not be sent back (and is blocked outright by browsers that block third-party cookies). Through the proxy, the browser only ever talks to the Vercel address, and the session cookie is an ordinary first-party cookie for that address.
+
+> Vercel *preview* deployments (other `*.vercel.app` URLs) can load the page but **can't sign in**, because the backend only accepts requests whose Origin is `FRONTEND_URL` (`https://automailzp.vercel.app`). That's intentional.
+>
+> If you rename the Render service, update the destination in `frontend/vercel.json`. If you rename the Vercel project, update `FRONTEND_URL` and `ALLOWED_HOSTS` on Render.
 
 ---
 
@@ -279,9 +277,13 @@ Add each domain in its platform first. The platform then shows the exact DNS rec
 
 ### Vercel (frontend)
 
-| Variable | Required | Value |
-|---|---|---|
-| `VITE_API_BASE_URL` | Yes | `https://api.zodiacpatent.com` |
+None. Leave `VITE_API_BASE_URL` (and `VITE_API_URL`) **unset**. The `/api` rewrite in `frontend/vercel.json` does the routing.
+
+On Render, for this free setup: `FRONTEND_URL=https://automailzp.vercel.app`, `ALLOWED_HOSTS=automailzp.onrender.com,automailzp.vercel.app`, `TRUST_PROXY=1`.
+
+**About `TRUST_PROXY=1` behind the Vercel proxy:**
+- **Why 1:** the app trusts only Render's own load balancer. That's the only part of the request path that records the address that actually connected and can't be forged. A higher value would make the app believe client-supplied `X-Forwarded-For` entries, and anyone calling the Render URL directly could then fake a new address for every sign-in attempt and get around the per-client limit.
+- **Trade-off:** behind Vercel, the "client" the limiter sees is the Vercel edge server forwarding the request, not each person's own address. Team members reaching the same Vercel edge share one counter: 5 wrong passwords there pause sign-in for 15 minutes for everyone on that edge. The overall limit (50 failures per 15 minutes) is unchanged. A restart of the Render service clears the counters.
 
 ### Local Windows use (unchanged)
 
@@ -344,7 +346,7 @@ With a disk, everything that must survive restarts and deploys is written under 
 - [ ] `SMTP_PASS`, `APP_PASSWORD_HASH` and `SESSION_SECRET` are set **only** on Render, not on Vercel, not in GitHub, not in chat.
 - [ ] The shared password is long (a passphrase of 4+ random words, or 16+ characters) and is shared through a password manager.
 - [ ] `SESSION_SECRET` is random and at least 32 characters (Render-generated).
-- [ ] Vercel has only `VITE_API_BASE_URL`.
+- [ ] Vercel has no environment variables (in particular no `VITE_API_BASE_URL`); `/api` is proxied by `frontend/vercel.json`.
 
 **Network and domains**
 - [ ] `FRONTEND_URL` is exactly `https://app.zodiacpatent.com`. CORS allows only this origin, with credentials, never `*`.

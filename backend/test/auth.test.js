@@ -423,3 +423,53 @@ test('without DATA_DIR (Render Free) the app runs and tells signed-in users that
     await new Promise((r) => server.close(r));
   }
 });
+
+// ---------------------------------------------------------------------------
+// Vercel → Render proxy (frontend/vercel.json forwards /api/* to Render).
+test('behind the proxy chain, forged X-Forwarded-For entries cannot dodge the login limiter (TRUST_PROXY=1)', async () => {
+  const srv = await startProd({ env: { TRUST_PROXY: '1' }, loginLimiter: new LoginLimiter({ perIp: 5, global: 50 }) });
+  try {
+    // Render's load balancer appends the address that really connected as the LAST
+    // entry; everything before it is client-controlled and must be ignored.
+    const attempt = async (spoofed, real) => {
+      const c = srv.client();
+      return c.request('POST', '/api/auth/login', { json: { username: 'zodiac-team', password: 'wrong password here' }, headers: { 'x-forwarded-for': `${spoofed}, ${real}` } });
+    };
+    for (let i = 0; i < 5; i += 1) assert.equal((await attempt(`198.51.100.${i}`, '203.0.113.7')).status, 401);
+    assert.equal((await attempt('198.51.100.99', '203.0.113.7')).status, 429, 'rotating the forged part does not reset the limit');
+    assert.equal((await attempt('203.0.113.7', '203.0.113.8')).status, 401, 'a different real address has its own limit');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('requests forwarded by the Vercel proxy are accepted (Host and Origin of the Vercel site)', async () => {
+  const VERCEL = 'https://automailzp.vercel.app';
+  const srv = await startProd({ env: { FRONTEND_URL: VERCEL, ALLOWED_HOSTS: 'automailzp.onrender.com,automailzp.vercel.app' } });
+  try {
+    for (const host of ['automailzp.onrender.com', 'automailzp.vercel.app']) {
+      assert.equal((await rawRequest(srv.base, { host })).status, 200, host);
+    }
+    assert.equal((await rawRequest(srv.base, { host: 'other.vercel.app' })).status, 403);
+    const c = srv.client();
+    const login = await c.request('POST', '/api/auth/login', { json: { username: 'zodiac-team', password: PASSWORD }, origin: VERCEL });
+    assert.equal(login.status, 200);
+    c.csrf = login.data.data.csrfToken;
+    assert.equal((await c.request('GET', '/api/auth/session', { origin: VERCEL })).data.data.authenticated, true);
+    assert.equal((await c.request('POST', '/api/auth/logout', { origin: VERCEL })).status, 200);
+    assert.equal((await c.request('POST', '/api/auth/login', { json: { username: 'zodiac-team', password: PASSWORD }, origin: 'https://evil.vercel.app' })).status, 403);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('frontend/vercel.json proxies /api to Render before the SPA fallback, with a same-origin CSP', async () => {
+  const vercel = JSON.parse(await fs.readFile(new URL('../../frontend/vercel.json', import.meta.url), 'utf8'));
+  assert.deepEqual(vercel.rewrites, [
+    { source: '/api/:path*', destination: 'https://automailzp.onrender.com/api/:path*' },
+    { source: '/(.*)', destination: '/index.html' },
+  ]);
+  const csp = vercel.headers.flatMap((h) => h.headers).find((h) => h.key === 'Content-Security-Policy').value;
+  assert.match(csp, /connect-src 'self';/);
+  assert.doesNotMatch(csp, /connect-src[^;]*https?:/, 'the browser never calls another origin');
+});
