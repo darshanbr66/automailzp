@@ -64,15 +64,15 @@ If the password ever leaks, or a team member leaves, delete it under **App passw
 
 All settings live in **`backend\.env`**. This file is excluded from Git and must never be shared. The password is read only by the backend; it is never sent to the browser, shown in the app, or written to the logs.
 
-`setup.bat` creates `backend\.env` from `backend\.env.example` (only if it doesn't exist yet, so it never overwrites your password). Fill in the ZodiacPatent mailbox you send from. For example, while testing with Darshan's mailbox:
+`setup.bat` creates `backend\.env` from `backend\.env.example` (only if it doesn't exist yet, so it never overwrites your password). Fill in the ZodiacPatent mailbox you send from. For example, with Vikram's mailbox:
 
 ```ini
 SMTP_HOST=smtp.hostinger.com
 SMTP_PORT=465
 SMTP_SECURE=true
-SMTP_USER=darshan@zodiacpatent.com
+SMTP_USER=vikram@zodiacpatent.com
 SMTP_PASS=
-SMTP_FROM=darshan@zodiacpatent.com
+SMTP_FROM=vikram@zodiacpatent.com
 ```
 
 The sender address is **only** read from this file. Nothing in the source code names a mailbox.
@@ -117,7 +117,7 @@ To move from Darshan's mailbox to Vikram's (or any other ZodiacPatent mailbox), 
    ```
 
 4. Save, then start the app again.
-5. Check that the top bar says **Sending as vikram@zodiacpatent.com**, then click **Test SMTP Connection**.
+5. Check that the top bar says **Sending as vikram@zodiacpatent.com**, then click **Test Email Connection**.
 
 From then on, emails go out from the new mailbox and the history's **Sender Email** column records it. Earlier history rows keep the sender they were actually sent from, and duplicate detection still covers them. You may want to delete the old App Password in hPanel once it's no longer used.
 
@@ -139,7 +139,7 @@ From then on, emails go out from the new mailbox and the history's **Sender Emai
 
 Then, inside the app:
 
-6. **Click "Test SMTP Connection"** (top right). See [the next section](#testing-the-smtp-connection).
+6. **Click "Test Email Connection"** (top right). See [the next section](#testing-the-smtp-connection).
 7. **Upload** the attorney Excel workbook (Compose Email → step 1).
 8. **Check the column mapping** (step 2). Choose which columns hold the attorney name and email address (and the registration number, if the workbook has one), then click **Save mapping**.
 9. **Set up the email template** on the **Template Settings** page and click **Save Template**.
@@ -153,7 +153,7 @@ You can also run `scripts\start.bat` directly instead of using the shortcut.
 
 ## Testing the SMTP connection
 
-The top bar shows the sender configured in `backend\.env` (for example **Sending as darshan@zodiacpatent.com**) and a coloured dot:
+The top bar shows the sender configured in `backend\.env` (for example **Sending as vikram@zodiacpatent.com**) and a coloured dot:
 
 | Dot | Meaning |
 |---|---|
@@ -162,7 +162,7 @@ The top bar shows the sender configured in `backend\.env` (for example **Sending
 | Green, "Connection OK" | The app connected to `smtp.hostinger.com` over SSL and logged in with the App Password. |
 | Red, "Connection failed" | The last test (or a send) failed. The message explains why. |
 
-**Test SMTP Connection** connects to Hostinger and logs in, then disconnects. **It does not send an email.** Typical results:
+**Test Email Connection** connects to Hostinger and logs in, then disconnects. **It does not send an email.** Typical results:
 
 - **"Hostinger rejected the login for <your mailbox>…"**: the App Password is wrong, was pasted with extra spaces, was deleted in hPanel, or you used the hPanel/mailbox password instead. Create a new App Password, paste it into `backend\.env`, restart the app, and test again.
 - **"Could not connect to smtp.hostinger.com…"**: no internet, or a firewall/antivirus is blocking port 465.
@@ -286,7 +286,7 @@ Back up `backend\data\sent-emails.xlsx` regularly. It's your record of who has b
 |---|---|
 | **"Port 5173 (or 4000) is already used by another program"** | Another program, often another development server, is using the port. Close it and start again. |
 | **"Email not configured — see README"** | Open `backend\.env`, check the setting named in the message (usually `SMTP_PASS`), save, then stop and start the app. |
-| **"Hostinger rejected the login…"** | Wrong or revoked App Password, or the hPanel/mailbox password was used. Generate a new App Password in hPanel, paste it after `SMTP_PASS=` (no spaces or quotes), restart, and click **Test SMTP Connection**. Also check `SMTP_USER` is the full address. |
+| **"Hostinger rejected the login…"** | Wrong or revoked App Password, or the hPanel/mailbox password was used. Generate a new App Password in hPanel, paste it after `SMTP_PASS=` (no spaces or quotes), restart, and click **Test Email Connection**. Also check `SMTP_USER` is the full address. |
 | **"Could not connect to smtp.hostinger.com"** | Check the internet connection. Corporate firewalls and some antivirus programs block outgoing port 465; allow it, or try `SMTP_PORT=587` with `SMTP_SECURE=false`. |
 | **"A secure (SSL/TLS) connection … could not be established"** | Use `SMTP_PORT=465` with `SMTP_SECURE=true` (or 587 with `false`). Antivirus "email scanning" can also break SSL. |
 | **"Hostinger does not allow sending as …"** | `SMTP_FROM` must be the same mailbox as `SMTP_USER`. |

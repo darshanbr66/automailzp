@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfigFromEnvFile } from './config.js';
 import { createApp } from './app.js';
-import { SmtpMailer } from './email.js';
+import { createMailer } from './mailer.js';
 
 const config = loadConfigFromEnvFile();
 const where = config.isProduction ? 'the Render environment variables' : 'backend/.env';
@@ -44,9 +44,10 @@ console.log(`[config] ${config.isProduction ? 'Production' : 'Local'} mode. Data
 console.log(`[config] Team login: ${config.auth.enabled ? 'required' : 'disabled (local use only)'}`);
 if (config.isProduction) console.log(`[config] Allowed frontend origin: ${config.allowedOrigins.join(', ')}`);
 
-let mailer = null;
-if (config.smtpConfigured) {
-  mailer = new SmtpMailer(config.smtp);
+const mailer = createMailer(config);
+if (mailer && config.email.provider === 'resend') {
+  console.log(`[config] Sending as ${config.email.from} via the Resend API (HTTPS)`);
+} else if (mailer) {
   console.log(`[config] Sending as ${config.smtp.from} via ${config.smtp.host}:${config.smtp.port} (${config.smtp.secure ? 'SSL' : 'STARTTLS'})`);
 } else {
   console.warn(`[config] Email sending is not configured. Fix these in ${where}, then restart:`);

@@ -8,15 +8,16 @@ export default function SmtpStatus({ smtp, testing, onTest }) {
   const test = smtp.lastTest;
   const dot = !smtp.configured ? 'dot-warn' : !test ? 'dot-warn' : test.ok ? 'dot-on' : 'dot-error';
   const state = !smtp.configured ? 'Not configured' : !test ? 'Not tested yet' : test.ok ? 'Connection OK' : 'Connection failed';
+  const via = smtp.provider === 'resend' ? 'Resend API (HTTPS)' : `${smtp.host}:${smtp.port} (${smtp.secure ? 'SSL' : 'STARTTLS'})`;
   return (
     <div className="outlook-status">
       <span className={`dot ${dot}`} />
-      <span className="account" title={`${smtp.host}:${smtp.port} (${smtp.secure ? 'SSL' : 'STARTTLS'}) — ${state}`}>
+      <span className="account" title={`${via} — ${state}`}>
         Sending as <strong>{smtp.from || '(SMTP_FROM not set)'}</strong>
-        <span className="muted small"> · {state}</span>
+        <span className="muted small"> · {smtp.provider === 'resend' ? 'via Resend · ' : ''}{state}</span>
       </span>
       <button className="btn btn-small btn-ghost" onClick={onTest} disabled={testing}>
-        {testing ? <><Spinner /> Testing…</> : 'Test SMTP Connection'}
+        {testing ? <><Spinner /> Testing…</> : 'Test Email Connection'}
       </button>
     </div>
   );

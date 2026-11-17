@@ -462,7 +462,7 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onSmtpCha
 
       {result?.type === 'success' && (
         <Alert type="success" onClose={() => setResult(null)}>
-          <div className="success-line" title="Accepted by the Hostinger mail server for delivery">
+          <div className="success-line" title="Accepted by the email service for delivery">
             <span className="check-icon" aria-hidden="true">✓</span>
             {result.text}
           </div>

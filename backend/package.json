@@ -6,7 +6,7 @@
     "dev": "node --watch src/server.js",
     "test": "node --test --test-concurrency=1",
     "hash-password": "node scripts/hash-password.js",
-    "check": "node --check src/app.js && node --check src/server.js && node --check src/config.js && node --check src/excel.js && node --check src/email.js && node --check src/history.js && node --check src/identity.js && node --check src/auth.js && node --check scripts/hash-password.js && node --check src/template.js && node --check src/utils.js"
+    "check": "node --check src/app.js && node --check src/server.js && node --check src/config.js && node --check src/excel.js && node --check src/email.js && node --check src/history.js && node --check src/identity.js && node --check src/auth.js && node --check src/resend.js && node --check src/mailer.js && node --check scripts/hash-password.js && node --check src/template.js && node --check src/utils.js"
   },
   "license": "UNLICENSED",
   "description": "Local backend for the attorney email tool (Hostinger SMTP)",

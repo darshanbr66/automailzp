@@ -105,7 +105,7 @@ export default function HistoryPage({ active }) {
     <Card title="Sent history" actions={<button className="btn btn-small btn-ghost" onClick={load}>Refresh</button>}>
       <p className="muted small">
         Every send attempt is recorded in <code>{file || 'backend/data/sent-emails.xlsx'}</code>.
-        {' '}“Success” means the Hostinger mail server accepted the email for delivery; it does not confirm the recipient received it.
+        {' '}“Success” means the email service (Hostinger SMTP or Resend) accepted the email for delivery; it does not confirm the recipient received it.
         {' '}“Failed” emails were not sent. “Uncertain” means the connection dropped mid-send, so the email may or may not have gone out.
         {sender && <> Emails are currently sent from <strong>{sender}</strong>.</>}
       </p>

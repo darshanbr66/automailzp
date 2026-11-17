@@ -7,7 +7,7 @@ This guide moves the app from a single Windows PC to a hosted setup the whole te
 | Frontend (React, static files) | **Vercel** | `https://app.zodiacpatent.com` |
 | Backend API (Node/Express) | **Render**, Free Web Service | `https://api.zodiacpatent.com` |
 | History, templates, mapping, sessions | **Temporary** app folder on Render (no disk) | `backend/data` inside the service |
-| Outgoing email | **Hostinger SMTP** | `smtp.hostinger.com:465` |
+| Outgoing email | **Resend HTTPS API** (free plan) | `api.resend.com`, sender `vikram@zodiacpatent.com` |
 | Access | One **shared team login** | — |
 
 ```
@@ -18,7 +18,7 @@ Browser ──HTTPS──▶ app.zodiacpatent.com (Vercel: static files only, no
                                    └── smtp.hostinger.com:465 (App Password)
 ```
 
-**Where secrets live:** the SMTP App Password, the login password hash and the session secret exist **only** as Render environment variables. Vercel only knows the public API address. The browser only ever holds an HttpOnly session cookie that JavaScript can't read.
+**Where secrets live:** the Resend API key, the login password hash and the session secret exist **only** as Render environment variables. Vercel only knows the public API address. The browser only ever holds an HttpOnly session cookie that JavaScript can't read.
 
 ---
 
@@ -33,8 +33,8 @@ This setup uses **Render Free without a persistent disk**. The backend stores it
 | **Column mapping** (`settings.json`) | **No.** Columns are guessed again from the headings. |
 | **Sign-in sessions** (`sessions/`) | **No.** Everyone has to sign in again. |
 | **Uploaded attorney workbook** | No (it was never stored on disk, even with a disk) |
-| SMTP settings, team login, all environment variables | **Yes**, they're Render settings, not files |
-| Sent emails themselves | Yes, already delivered by Hostinger |
+| Email settings, team login, all environment variables | **Yes**, they're Render settings, not files |
+| Sent emails themselves | Yes, already handed to Resend for delivery |
 
 **What this means in practice:**
 
@@ -44,6 +44,35 @@ This setup uses **Render Free without a persistent disk**. The backend stores it
 - The first request after the service has been asleep takes up to about a minute while Render starts it.
 
 **To make data permanent later** (no code changes): move the service to a paid instance type, add a persistent disk mounted at `/var/data`, and add the environment variable `DATA_DIR=/var/data`. Don't set `DATA_DIR` without a disk: the server deliberately refuses to start if that folder is missing, so it can't silently lose data.
+
+---
+
+## Email sending with Resend
+
+Render Free blocks outgoing SMTP (ports 25, 465 and 587), so the hosted backend sends through the **Resend HTTPS API** instead of Hostinger SMTP. Templates, placeholders, duplicate checks and Sent History work exactly the same. The desktop version keeps using Hostinger SMTP (`EMAIL_PROVIDER=smtp`, the default).
+
+**Free plan:** 3,000 emails a month, at most **100 a day**, no card needed.
+
+**1. Verify zodiacpatent.com in Resend** so emails can be sent as `vikram@zodiacpatent.com`:
+
+1. Resend dashboard → **Domains → Add domain** → `zodiacpatent.com`.
+2. In Hostinger hPanel → **DNS Zone**, **add** the records Resend shows. Enter only the part before `.zodiacpatent.com` as the name, and copy the values exactly from Resend:
+
+   | Type | Name | Value | Priority |
+   |---|---|---|---|
+   | MX | `send` | from Resend (e.g. `feedback-smtp.<region>.amazonses.com`) | 10 (or 20 if 10 is taken) |
+   | TXT | `send` | `v=spf1 include:amazonses.com ~all` | |
+   | TXT | `resend._domainkey` | `p=…` from Resend (case-sensitive) | |
+
+3. Click **Verify** in Resend and wait for **Verified** (minutes to a few hours).
+
+These records only add new names (`send`, `resend._domainkey`). **Don't change or delete the existing MX, SPF, DKIM or DMARC records**: they keep the Hostinger mailboxes working, and replies still arrive in Vikram's Hostinger inbox.
+
+**2. Create an API key:** Resend → **API Keys → Create**, permission **Sending access**. Copy it once into Render as `RESEND_API_KEY`. Never put it in GitHub, Vercel or chat.
+
+**3. Check it:** after deploying, click **Test Email Connection**. It connects to Resend without sending anything. With a sending-only key, it confirms the key is valid but can't read the domain status; check that the domain shows **Verified** in the Resend dashboard, then send one test email to an address you own.
+
+**Delivery protection:** each send carries an idempotency key (its unique send request ID), so if the same send request reaches Resend twice (for example after a connection drop and retry), Resend sends it only once. "Success" in Sent History means Resend accepted the email (it returned an email ID); it doesn't confirm delivery.
 
 ---
 
@@ -73,7 +102,7 @@ You need:
 - A **Render** account (the Free plan is enough for this setup; see the section above for what that costs you in stored data).
 - A **Vercel** account.
 - Access to the **DNS settings for zodiacpatent.com** (normally Hostinger hPanel → *Domains* → *DNS / Nameservers*, if Hostinger hosts the domain).
-- A **Hostinger App Password** for the sending mailbox (see the README, "Hostinger App Password").
+- A free **Resend** account, with zodiacpatent.com verified (see [Email sending with Resend](#email-sending-with-resend)). Render Free blocks SMTP, so Hostinger SMTP is only used by the desktop version.
 - Node.js 20.19+ on your PC, to generate the login hash.
 
 ---
@@ -145,9 +174,10 @@ The repository contains `render.yaml`, which describes the service, its disk and
    |---|---|
    | `APP_USERNAME` | e.g. `zodiac-team` |
    | `APP_PASSWORD_HASH` | the `scrypt:...` value from step 3 |
-   | `SMTP_USER` | e.g. `darshan@zodiacpatent.com` |
-   | `SMTP_PASS` | that mailbox's Hostinger App Password |
-   | `SMTP_FROM` | same as `SMTP_USER` |
+   | `RESEND_API_KEY` | your Resend API key (starts with `re_`) |
+   | `SMTP_FROM` | `vikram@zodiacpatent.com` (the sender; its domain must be verified in Resend) |
+
+   `EMAIL_PROVIDER=resend` is already set by `render.yaml`. `SMTP_USER`, `SMTP_PASS`, `SMTP_HOST`, `SMTP_PORT` and `SMTP_SECURE` are **not** needed on Render.
 
 4. Apply. Render builds (`npm ci --omit=dev` in `backend/`) and starts `node src/server.js`.
 
@@ -176,7 +206,7 @@ Don't add a disk, and **don't set `DATA_DIR`**. Then add every variable from [se
 [config] Production mode. Data folder: /opt/render/project/src/backend/data (TEMPORARY)
 [config] Team login: required
 [config] Allowed frontend origin: https://app.zodiacpatent.com
-[config] Sending as darshan@zodiacpatent.com via smtp.hostinger.com:465 (SSL)
+[config] Sending as vikram@zodiacpatent.com via smtp.hostinger.com:465 (SSL)
 Backend listening on 0.0.0.0:10000
 ```
 
@@ -242,7 +272,7 @@ Add each domain in its platform first. The platform then shows the exact DNS rec
 2. `https://api.zodiacpatent.com/api/history` → `401` with "Your session has ended. Please sign in again." This confirms the API is protected.
 3. Open `https://app.zodiacpatent.com`. You should see only the **Sign in** page.
 4. Sign in with the shared username and password.
-5. The top bar shows **Sending as <mailbox>**. Click **Test SMTP Connection**. It must say the connection succeeded (no email is sent).
+5. The top bar shows **Sending as <mailbox>**. Click **Test Email Connection**. It must say it connected to Resend and that zodiacpatent.com is verified (no email is sent).
 6. Upload a workbook, check the mapping and template, then send **one** test email to an address you own.
 7. **Sent History** shows the send. On Render Free this history is temporary (see the top of this guide).
 8. **Sign out**, then sign in again.
@@ -267,12 +297,10 @@ Add each domain in its platform first. The platform then shows the exact DNS rec
 | `SESSION_SECRET` | Yes | (random, ≥ 32 characters) | Generated by Render with the Blueprint. Changing it signs everyone out. |
 | `SESSION_IDLE_HOURS` | No | `2` | Sign-out after this long without activity. |
 | `SESSION_MAX_AGE_HOURS` | No | `12` | Maximum session length, even when active. |
-| `SMTP_HOST` | Yes | `smtp.hostinger.com` | |
-| `SMTP_PORT` | Yes | `465` | |
-| `SMTP_SECURE` | Yes | `true` | `true` for 465. |
-| `SMTP_USER` | Yes | `darshan@zodiacpatent.com` | Mailbox that sends. |
-| `SMTP_PASS` | Yes | (App Password) | Hostinger **App Password** for `SMTP_USER`. |
-| `SMTP_FROM` | Yes | same as `SMTP_USER` | |
+| `EMAIL_PROVIDER` | Yes | `resend` | `resend` = Resend HTTPS API (needed on Render Free). `smtp` = Hostinger SMTP (desktop version; blocked on Render Free). |
+| `RESEND_API_KEY` | Yes (Resend) | `re_…` | Resend API key. Secret: Render only, never logged or sent to the browser. |
+| `SMTP_FROM` | Yes | `vikram@zodiacpatent.com` | Sender address for both providers. With Resend, its domain must be verified there. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` | Only for `smtp` | | Hostinger SMTP settings; not used with `EMAIL_PROVIDER=resend`. |
 | `PORT` | No | set by Render | Don't set it yourself. |
 
 ### Vercel (frontend)
@@ -306,7 +334,7 @@ With a disk, everything that must survive restarts and deploys is written under 
 └── sessions/                  one small file per signed-in browser (named by an HMAC, not the cookie)
 ```
 
-- **Never stored on disk:** the uploaded attorney workbook (kept in memory only), passwords, SMTP credentials.
+- **Never stored on disk:** the uploaded attorney workbook (kept in memory only), passwords, the Resend API key and SMTP credentials.
 - **Deploys never overwrite these files.** The app only creates them when they're first needed, and nothing in the build writes to `/var/data`. The source folder (`/opt/render/project/src`) is replaced on every deploy, so nothing persistent is kept there.
 - **Missing disk:** the server stops at start-up with a clear message rather than writing to temporary storage.
 - **Backups:** Render takes automatic daily snapshots of persistent disks (see *Disks* in the Render dashboard, where you can restore one). For your own copies, download `sent-emails.xlsx` regularly using Render's **Shell** or SSH (`scp`). See Render's documentation on transferring files.
@@ -331,7 +359,7 @@ With a disk, everything that must survive restarts and deploys is written under 
 |---|---|
 | **Deploy a new version** | Push to GitHub, then Render → **Manual Deploy**. Vercel deploys the frontend on push. The backend is briefly unavailable during a deploy (services with a disk can't run old and new side by side). Avoid deploying while someone is sending. |
 | **Turn on automatic backend deploys** | Set `autoDeploy: true` in `render.yaml` (or Render → Settings → Auto-Deploy). |
-| **Switch mailbox (e.g. Darshan → Vikram)** | Render → Environment: change `SMTP_USER`, `SMTP_FROM` and `SMTP_PASS`, then save. Render restarts the service. Then **Test SMTP Connection**. History rows keep the sender they were actually sent from. |
+| **Change the sender address** | Render → Environment: change `SMTP_FROM` (it must be on a domain verified in Resend), then save. Render restarts the service. Then **Test Email Connection**. History rows keep the sender they were actually sent from. |
 | **Change the shared password** | Run `npm run hash-password`, replace `APP_PASSWORD_HASH` on Render, and tell the team. Existing sessions stay valid until they expire. To sign everyone out immediately, also change `SESSION_SECRET`. |
 | **Sign everyone out** | Change `SESSION_SECRET` on Render. |
 | **Someone is locked out ("Too many failed sign-in attempts")** | Wait 15 minutes, or restart the service. The rate limiter is in memory. |
@@ -343,7 +371,7 @@ With a disk, everything that must survive restarts and deploys is written under 
 
 **Secrets and configuration**
 - [ ] The repository is **private**, and `git ls-files` shows no `.env`, `.xlsx` or `backend/data/*` files.
-- [ ] `SMTP_PASS`, `APP_PASSWORD_HASH` and `SESSION_SECRET` are set **only** on Render, not on Vercel, not in GitHub, not in chat.
+- [ ] `RESEND_API_KEY`, `APP_PASSWORD_HASH` and `SESSION_SECRET` are set **only** on Render, not on Vercel, not in GitHub, not in chat.
 - [ ] The shared password is long (a passphrase of 4+ random words, or 16+ characters) and is shared through a password manager.
 - [ ] `SESSION_SECRET` is random and at least 32 characters (Render-generated).
 - [ ] Vercel has no environment variables (in particular no `VITE_API_BASE_URL`); `/api` is proxied by `frontend/vercel.json`.
@@ -367,7 +395,7 @@ With a disk, everything that must survive restarts and deploys is written under 
 - [ ] Everyone on the team knows that on Render Free, history and duplicate protection reset on every restart.
 - [ ] Health check path is `/healthz`. It reveals nothing beyond OK / not OK.
 - [ ] Download a copy of `sent-emails.xlsx` regularly, in addition to Render's disk snapshots.
-- [ ] Revoke the Hostinger App Password (hPanel) and change the shared password when someone leaves the team.
+- [ ] Use a Resend API key with **Sending access** only, and delete/replace it in the Resend dashboard (and change the shared password) when someone leaves the team.
 
 ---
 
@@ -375,7 +403,7 @@ With a disk, everything that must survive restarts and deploys is written under 
 
 These were considered and deliberately left as they are for a small team, but you should know about them.
 
-1. **Render Free storage is temporary.** History, the saved template, the column mapping and sessions are lost on every restart, sleep or redeploy, and duplicate protection only covers sends since the last restart (see the top of this guide). Free services also sleep when idle and take up to a minute to wake. Render may also restrict outgoing mail ports on free services; if **Test SMTP Connection** fails on Free with a connection error (not a login error), that's the likely cause, and a paid instance is needed to send.
+1. **Render Free storage is temporary.** History, the saved template, the column mapping and sessions are lost on every restart, sleep or redeploy, and duplicate protection only covers sends since the last restart (see the top of this guide). Free services also sleep when idle and take up to a minute to wake. Render Free blocks outgoing SMTP ports, which is why emails are sent through the Resend HTTPS API.
 2. **Not yet tested on real Render/Vercel/DNS.** Everything was tested locally:
    - 71 automated backend tests, including production-mode login, cookies, CSRF, CORS, host checks, session persistence and expiry, rate limiting and team concurrency.
    - Isolated `npm ci` installs of `backend/` and `frontend/` to mimic how Render and Vercel build.
@@ -384,11 +412,11 @@ These were considered and deliberately left as they are for a small team, but yo
    Run the checks in [section 7](#7-check-the-deployment) after the first deploy.
 3. **Uploaded workbook is in memory.** It's lost on every restart or deploy and must be uploaded again. It's shared by everyone, so the last upload wins.
 4. **Single instance, brief downtime on deploy.** Services with a persistent disk can't do zero-downtime deploys or run several instances. The app's locks (one send at a time, serialized history writes) assume one process.
-5. **Sending is serialized.** If Hostinger is slow or times out (up to about a minute in the worst case), other team members' sends wait.
+5. **Sending is serialized.** If the email service is slow or times out (up to about 30 seconds per send with Resend), other team members' sends wait.
 6. **Shared login = no per-person audit trail.** The history records the sending *mailbox*, not which team member clicked Send.
 7. **Rate limiting is in memory.** It resets on restart. Per-client limits rely on Render passing the real client IP (`TRUST_PROXY=1`). If that ever stops working, all clients share one counter, so 5 wrong attempts would briefly lock out the whole team (safe, but inconvenient).
 8. **Session revocation** for everyone at once is done by changing `SESSION_SECRET`. There's no "sign out this one browser remotely".
 9. **Hosted history and PC history are separate.** If the Windows desktop version is still used for sending, its `backend\data\sent-emails.xlsx` is a different file, and duplicate detection won't see sends made in the other one. Use one or the other, or copy the history over once (section 9) and stop sending from the PC.
 10. **Attorney data now leaves the PC.** When hosted, the uploaded workbook goes to the Render server (in memory) over HTTPS, and history (names, emails, firms) is stored on the Render disk. Make sure this fits your data-handling obligations.
-11. **Outgoing SMTP from Render.** Confirm with **Test SMTP Connection** after deploying (see item 1 about free services). Hostinger's own sending limits still apply.
+11. **Resend free-plan limits.** 100 emails per day (resets at midnight UTC) and 3,000 per month. Sends above the limit are refused with a clear message and recorded as Failed. Emails sent through Resend do not appear in the Hostinger Webmail Sent folder; the Resend dashboard (Emails) lists them for 30 days, and Sent History is the app's record.
 12. **The history workbook can only be downloaded through Render's Shell/SSH.** There's no download button in the app yet.

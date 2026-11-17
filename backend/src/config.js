@@ -104,16 +104,33 @@ export function loadConfig(env = process.env) {
   const pass = String(env.SMTP_PASS ?? '').trim();
   const from = clean(env.SMTP_FROM) || user;
 
-  if (!HOST_RE.test(host)) problems.push('SMTP_HOST is not a valid host name');
-  if (!Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535) problems.push('SMTP_PORT is not a valid port number');
-  if (smtpPort === 465 && !secure) problems.push('SMTP_SECURE must be true when SMTP_PORT is 465 (SSL)');
-  if (smtpPort === 587 && secure) problems.push('SMTP_SECURE must be false when SMTP_PORT is 587 (STARTTLS)');
-  if (!user) problems.push('SMTP_USER is not set');
-  else if (!SIMPLE_EMAIL_RE.test(user)) problems.push('SMTP_USER must be the full mailbox address, e.g. name@yourdomain.com');
-  if (!pass) problems.push('SMTP_PASS is empty (paste the Hostinger App Password after SMTP_PASS=)');
-  if (from && !SIMPLE_EMAIL_RE.test(from)) problems.push('SMTP_FROM must be a plain email address');
-  if (user && from && from.toLowerCase() !== user.toLowerCase()) {
-    warnings.push('SMTP_FROM differs from SMTP_USER. Hostinger normally rejects a sender address that is not the signed-in mailbox.');
+  // Which service sends the emails: "smtp" (Hostinger SMTP, the default) or
+  // "resend" (Resend HTTPS API, for hosts that block SMTP ports such as Render Free).
+  const providerRaw = (clean(env.EMAIL_PROVIDER) || 'smtp').toLowerCase();
+  const provider = ['smtp', 'resend'].includes(providerRaw) ? providerRaw : 'smtp';
+  // The API key is never logged. Example values such as "re_your_api_key" count as not set.
+  const resendApiKeyRaw = String(env.RESEND_API_KEY ?? '').trim();
+  const resendApiKey = /^re_(your|x+$|\.\.\.|<)/i.test(resendApiKeyRaw) ? '' : resendApiKeyRaw;
+
+  if (providerRaw !== provider) {
+    problems.push('EMAIL_PROVIDER must be "smtp" or "resend"');
+  } else if (provider === 'resend') {
+    if (!resendApiKey) problems.push('RESEND_API_KEY is not set (create an API key in the Resend dashboard)');
+    else if (!/^re_[A-Za-z0-9_-]{8,}$/.test(resendApiKey)) problems.push('RESEND_API_KEY does not look like a Resend API key (it starts with "re_")');
+    if (!from) problems.push('SMTP_FROM is not set (the sender address, e.g. name@yourdomain.com, on a domain verified in Resend)');
+    else if (!SIMPLE_EMAIL_RE.test(from)) problems.push('SMTP_FROM must be a plain email address');
+  } else {
+    if (!HOST_RE.test(host)) problems.push('SMTP_HOST is not a valid host name');
+    if (!Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535) problems.push('SMTP_PORT is not a valid port number');
+    if (smtpPort === 465 && !secure) problems.push('SMTP_SECURE must be true when SMTP_PORT is 465 (SSL)');
+    if (smtpPort === 587 && secure) problems.push('SMTP_SECURE must be false when SMTP_PORT is 587 (STARTTLS)');
+    if (!user) problems.push('SMTP_USER is not set');
+    else if (!SIMPLE_EMAIL_RE.test(user)) problems.push('SMTP_USER must be the full mailbox address, e.g. name@yourdomain.com');
+    if (!pass) problems.push('SMTP_PASS is empty (paste the Hostinger App Password after SMTP_PASS=)');
+    if (from && !SIMPLE_EMAIL_RE.test(from)) problems.push('SMTP_FROM must be a plain email address');
+    if (user && from && from.toLowerCase() !== user.toLowerCase()) {
+      warnings.push('SMTP_FROM differs from SMTP_USER. Hostinger normally rejects a sender address that is not the signed-in mailbox.');
+    }
   }
 
   return {
@@ -132,6 +149,8 @@ export function loadConfig(env = process.env) {
     auth,
     fatal,
     smtp: { host, port: smtpPort, secure, user, pass, from },
+    email: { provider, from, resendApiKey },
+    // Name kept for compatibility: true when the selected email provider is fully configured.
     smtpConfigured: problems.length === 0,
     problems,
     warnings,

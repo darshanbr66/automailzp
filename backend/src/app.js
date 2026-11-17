@@ -11,6 +11,7 @@ import {
 import { DEFAULT_TEMPLATE, TemplateStore, renderEmail } from './template.js';
 import { HistoryStore } from './history.js';
 import { isValidEmail, validateMessage } from './email.js';
+import { providerLabel } from './mailer.js';
 import { countsAsSent, matchHistory, normalizeEmail, normalizeText, recordIdentity } from './identity.js';
 
 const CSRF_HEADER = 'x-oea-request';
@@ -344,7 +345,9 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     // Never includes the password.
     return {
       configured: Boolean(mailer),
-      ...(mailer ? mailer.publicInfo() : { host: config.smtp.host, port: config.smtp.port, secure: config.smtp.secure, user: config.smtp.user, from: config.smtp.from }),
+      ...(mailer
+        ? mailer.publicInfo()
+        : { provider: config.email?.provider || 'smtp', host: config.email?.provider === 'resend' ? 'api.resend.com' : config.smtp.host, port: config.email?.provider === 'resend' ? 443 : config.smtp.port, secure: config.email?.provider === 'resend' ? true : config.smtp.secure, user: config.email?.provider === 'resend' ? null : config.smtp.user, from: config.smtp.from }),
       problems: config.problems,
       warnings: config.warnings,
       hosted: Boolean(config.isProduction),
@@ -366,9 +369,9 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     if (!smtpTestRunning) {
       smtpTestRunning = mailer
         .verify()
-        .then(() => {
-          lastSmtpTest = { ok: true, at: formatDateTime(), message: `Connected and logged in to ${config.smtp.host} as ${config.smtp.user}.` };
-          console.log('[smtp] Connection test succeeded');
+        .then((result) => {
+          lastSmtpTest = { ok: true, at: formatDateTime(), message: result?.message || `Connected and logged in to ${config.smtp.host} as ${config.smtp.user}.` };
+          console.log('[email] Connection test succeeded');
         })
         .catch((err) => {
           const e = err instanceof AppError ? err : new AppError(502, 'SMTP_ERROR', 'The connection test failed.');
@@ -535,7 +538,9 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       sendType = exact.length ? 'Resend' : 'First Send';
 
       attempted = true;
-      const sent = await mailer.send({ to, subject, body });
+      // The send request ID doubles as the provider's idempotency key (Resend), so a
+      // retried request can never produce a second email there.
+      const sent = await mailer.send({ to, subject, body, idempotencyKey: `zp-send-${requestId}` });
       if (lastSmtpTest && !lastSmtpTest.ok && lastSmtpTest.code === 'SMTP_AUTH_FAILED') lastSmtpTest = null;
 
       const entry = historyEntry({ identity, values, subject, senderEmail, status: 'Success', sendType });
@@ -543,7 +548,7 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       const saved = await history.append(entry);
       const response = {
         accepted: true,
-        message: `Hostinger accepted the email for delivery to ${to}.`,
+        message: `${providerLabel(mailer.publicInfo().provider)} accepted the email for delivery to ${to}.`,
         messageId: sent.messageId,
         entry,
         historySaved: saved.saved,

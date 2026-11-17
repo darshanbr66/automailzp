@@ -115,7 +115,7 @@ function Workspace({ auth, onSignOut }) {
       const status = await api('/api/smtp/test', { method: 'POST' });
       setSmtp(status);
       const t = status.lastTest;
-      setBanner(t.ok ? { type: 'success', text: `SMTP connection test succeeded. ${t.message} No email was sent.` } : { type: 'error', text: `SMTP connection test failed. ${t.message}` });
+      setBanner(t.ok ? { type: 'success', text: `Email connection test succeeded. ${t.message} No email was sent.` } : { type: 'error', text: `Email connection test failed. ${t.message}` });
     } catch (err) {
       setBanner({ type: 'error', text: err.message });
       if (err.code === 'BACKEND_UNAVAILABLE') setBackendError(err.message);
@@ -172,7 +172,7 @@ function Workspace({ auth, onSignOut }) {
           <Alert type="warning">
             Email sending is not configured yet: {(smtp.problems || []).join('; ')}.{' '}
             {smtp.hosted
-              ? 'An administrator needs to update the SMTP environment variables on Render and restart the service.'
+              ? 'An administrator needs to update the email settings (environment variables) on Render and restart the service.'
               : <>Edit <code>backend\.env</code> (see README, “Hostinger App Password”) and restart the app.</>}
           </Alert>
         )}
@@ -180,7 +180,7 @@ function Workspace({ auth, onSignOut }) {
         {smtp?.configured && smtp.warnings?.map((w) => <Alert key={w} type="warning">{w}</Alert>)}
         {banner && <Alert type={banner.type} onClose={() => setBanner(null)}>{banner.text}</Alert>}
         {!banner && smtp?.configured && smtp.lastTest && !smtp.lastTest.ok && (
-          <Alert type="error">Last SMTP connection test ({smtp.lastTest.at}) failed. {smtp.lastTest.message}</Alert>
+          <Alert type="error">Last email connection test ({smtp.lastTest.at}) failed. {smtp.lastTest.message}</Alert>
         )}
 
         {/* Pages stay mounted so unsaved edits survive switching tabs. */}

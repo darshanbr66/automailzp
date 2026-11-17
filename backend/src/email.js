@@ -110,7 +110,7 @@ export class SmtpMailer {
   /** Settings that are safe to show in the UI (no password). */
   publicInfo() {
     const { host, port, secure, user, from } = this.smtp;
-    return { host, port, secure, user, from };
+    return { provider: 'smtp', host, port, secure, user, from };
   }
 
   transport() {
