@@ -6,13 +6,22 @@
     "dev": "node --watch src/server.js",
     "test": "node --test --test-concurrency=1",
     "hash-password": "node scripts/hash-password.js",
-    "check": "node --check src/app.js && node --check src/server.js && node --check src/config.js && node --check src/excel.js && node --check src/email.js && node --check src/history.js && node --check src/identity.js && node --check src/auth.js && node --check src/resend.js && node --check src/mailer.js && node --check scripts/hash-password.js && node --check src/template.js && node --check src/utils.js"
+    "db:backup": "node scripts/db-backup.js",
+    "db:migrate": "node scripts/migrate-to-mongodb.js",
+    "check": "node --check src/app.js && node --check src/server.js && node --check src/config.js && node --check src/excel.js && node --check src/email.js && node --check src/history.js && node --check src/identity.js && node --check src/auth.js && node --check src/resend.js && node --check src/mailer.js && node --check src/audit.js && node --check src/useragent.js && node --check src/migrate.js && node --check src/dbops.js && node --check src/storage/index.js && node --check src/storage/file.js && node --check src/storage/mongo.js && node --check scripts/lib/cli.js && node --check scripts/db-backup.js && node --check scripts/db-restore.js && node --check scripts/db-verify.js && node --check scripts/db-reconcile.js && node --check scripts/migrate-to-mongodb.js && node --check scripts/db-migrate-rollback.js && node --check scripts/hash-password.js && node --check testing/server-process.js && node --check src/template.js && node --check src/utils.js && node --check scripts/db-init.js && node --check testing/atlas-smoke.js",
+    "db:restore": "node scripts/db-restore.js",
+    "db:verify": "node scripts/db-verify.js",
+    "db:reconcile": "node scripts/db-reconcile.js",
+    "db:migrate:rollback": "node scripts/db-migrate-rollback.js",
+    "db:init": "node scripts/db-init.js",
+    "db:smoke": "node testing/atlas-smoke.js"
   },
   "license": "UNLICENSED",
   "description": "Local backend for the attorney email tool (Hostinger SMTP)",
   "dependencies": {
     "dotenv": "^18.0.10",
     "express": "^5.3.0",
+    "mongodb": "^6.22.0",
     "multer": "^2.5.0",
     "nodemailer": "^10.6.0",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
@@ -21,5 +30,8 @@
   "type": "module",
   "engines": {
     "node": ">=20.19"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^10.4.3"
   }
 }

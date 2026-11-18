@@ -5,11 +5,11 @@ import { AppError, Mutex, atomicWriteFile, normalizeId, readFileIfExists, readJs
 
 export const HISTORY_COLUMNS = [
   'Record ID', 'Registration Number', 'Attorney Name', 'Recipient Email', 'Firm Name', 'City', 'State',
-  'Subject', 'Sent At', 'Sender Email', 'Status', 'Send Type',
+  'Subject', 'Sent At', 'Sender Email', 'Status', 'Send Type', 'Sent At UTC', 'Send Method', 'Operator',
 ];
 /** Columns every history workbook must have (the original layout). Newer columns are added automatically. */
 const CORE_COLUMNS = ['Record ID', 'Attorney Name', 'Recipient Email', 'Subject', 'Sent At', 'Sender Email', 'Status', 'Send Type'];
-const COLUMN_WIDTHS = [22, 20, 28, 32, 28, 16, 14, 50, 20, 32, 11, 12];
+const COLUMN_WIDTHS = [22, 20, 28, 32, 28, 16, 14, 50, 20, 32, 11, 12, 24, 12, 18];
 const FIELD_BY_COLUMN = {
   'Record ID': 'recordId',
   'Registration Number': 'registrationNumber',
@@ -23,6 +23,9 @@ const FIELD_BY_COLUMN = {
   'Sender Email': 'senderEmail',
   Status: 'status',
   'Send Type': 'sendType',
+  'Sent At UTC': 'sentAtUtc',
+  'Send Method': 'sendMethod',
+  Operator: 'operator',
 };
 const SHEET_NAME = 'Sent Emails';
 
@@ -193,4 +196,25 @@ export class HistoryStore {
       }
     });
   }
+}
+
+/**
+ * Build an Excel export of history entries (both storage modes). Values are
+ * written as text so nothing is interpreted as a formula.
+ */
+export function buildHistoryWorkbookBuffer(entries) {
+  const extra = ['Voided', 'Void Reason', 'Voided By', 'Voided At UTC'];
+  const header = [...HISTORY_COLUMNS, ...extra];
+  const rows = entries.map((e) => [
+    ...HISTORY_COLUMNS.map((col) => String(e[FIELD_BY_COLUMN[col]] ?? '')),
+    e.voided ? 'Yes' : '',
+    String(e.void?.reason ?? ''),
+    String(e.void?.operator ?? ''),
+    String(e.void?.atUtc ?? ''),
+  ]);
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([header, ...rows]);
+  ws['!cols'] = [...COLUMN_WIDTHS, 8, 30, 18, 24].map((wch) => ({ wch }));
+  XLSX.utils.book_append_sheet(wb, ws, SHEET_NAME);
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 }

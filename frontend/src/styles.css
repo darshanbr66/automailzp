@@ -268,6 +268,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--p
 
 /* ---- Sign-in ------------------------------------------------------------------ */
 .topbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+/* Which storage this server uses, so the MongoDB and file versions can't be confused. */
+.storage-badge { font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+.storage-db { color: #14532d; background: #dcfce7; border-color: #86efac; }
+.storage-file { color: #7c2d12; background: #ffedd5; border-color: #fdba74; }
 .session-info { display: flex; align-items: center; gap: 8px; padding-left: 14px; border-left: 1px solid var(--border); }
 .auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg); }
 .auth-card { width: 100%; max-width: 360px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(17, 24, 39, 0.08); padding: 22px 22px 18px; }
@@ -278,3 +282,27 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--p
 @media (max-width: 600px) {
   .session-info { padding-left: 0; border-left: 0; }
 }
+
+/* ---- Toast (sent-names clipboard notice) ------------------------------------- */
+.toast { position: fixed; right: 16px; bottom: 16px; z-index: 60; width: min(420px, calc(100vw - 32px)); max-height: 60vh; overflow: auto; display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: var(--radius); border: 1px solid; box-shadow: 0 10px 28px rgba(17, 24, 39, 0.18); font-size: var(--fs-body); }
+.toast-success { background: var(--success-soft); border-color: var(--success-border); color: #1f5c39; }
+.toast-warning { background: var(--warning-soft); border-color: var(--warning-border); color: #6b4a00; }
+.toast-body { flex: 1; display: flex; gap: 8px; align-items: flex-start; min-width: 0; }
+.toast-content { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast textarea { margin-top: 8px; font-size: var(--fs-small); background: var(--surface); }
+.toast .row-actions { margin-top: 8px; }
+
+/* ---- Shared views: statistics, operator, voided rows -------------------------- */
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.stat { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px; }
+.stat-value { font-size: 20px; font-weight: 600; color: var(--primary); line-height: 1.2; }
+.stat-label { font-size: var(--fs-small); color: var(--muted); }
+.stat-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.sub-heading { font-size: var(--fs-body); font-weight: 600; margin: 4px 0 6px; }
+.compact-table td, .compact-table th { padding: 4px 8px; }
+.operator-select { display: flex; align-items: center; gap: 6px; }
+.operator-select select { width: auto; padding: 3px 6px; font-size: var(--fs-small); }
+.operator-choices { display: grid; gap: 6px; margin: 10px 0 4px; }
+.operator-choice { display: flex; align-items: center; gap: 8px; font-size: var(--fs-body); cursor: pointer; }
+.voided-row td { color: var(--muted); }
+.voided-row td:not(:last-child) { text-decoration: line-through; text-decoration-color: rgba(100, 112, 127, 0.5); }

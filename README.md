@@ -304,13 +304,17 @@ Back up `backend\data\sent-emails.xlsx` regularly. It's your record of who has b
 
 ```bash
 npm run setup            # install backend + frontend dependencies
-npm test                 # backend automated tests (node:test)
+npm test                 # backend + frontend automated tests (node:test)
+npm run test:e2e         # browser tests (headless Chrome, in-memory MongoDB, mocked email)
+npm run test:all         # both of the above
 npm run check            # backend syntax check
 npm run build            # frontend production build
 npm run hash-password    # create APP_PASSWORD_HASH for the shared team login (hosted version)
 npm run start:backend    # backend only (http://localhost:4000)
 npm run start:frontend   # Vite dev server (http://localhost:5173)
 ```
+
+MongoDB backup, restore, verification, reconciliation of "Uncertain" sends and the production migration procedure: see [DATABASE-OPERATIONS.md](DATABASE-OPERATIONS.md).
 
 **Architecture:** React (Vite) frontend → Vite dev proxy (`/api`) → Express backend on `127.0.0.1:4000` → Nodemailer → `smtp.hostinger.com:465` (implicit TLS, minimum TLS 1.2, SMTP AUTH with the App Password).
 

@@ -82,3 +82,28 @@ export function StatusBadge({ status }) {
   const title = status === 'Uncertain' ? 'The connection dropped while sending; the email may or may not have been delivered.' : status === 'Failed' ? 'The email was not sent.' : 'Accepted by the mail server for delivery.';
   return <span className={`badge ${cls}`} title={title}>{status || 'Unknown'}</span>;
 }
+
+/**
+ * Bottom-right notification. Success toasts close by themselves after
+ * `autoCloseMs`; others stay until dismissed.
+ */
+export function Toast({ toast, onClose, children, autoCloseMs = 10000 }) {
+  useEffect(() => {
+    if (!toast || toast.type !== 'success') return undefined;
+    const t = setTimeout(onClose, autoCloseMs);
+    return () => clearTimeout(t);
+  }, [toast, onClose, autoCloseMs]);
+  if (!toast) return null;
+  return (
+    <div className={`toast toast-${toast.type}`} role={toast.type === 'success' ? 'status' : 'alert'} aria-live="polite">
+      <div className="toast-body">
+        {toast.type === 'success' && <span className="check-icon" aria-hidden="true">✓</span>}
+        <div className="toast-content">
+          <div>{toast.text}</div>
+          {children}
+        </div>
+      </div>
+      <button className="alert-close" onClick={onClose} aria-label="Dismiss">×</button>
+    </div>
+  );
+}

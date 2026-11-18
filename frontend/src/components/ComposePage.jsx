@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
-import { Alert, Card, Modal, Pager, Spinner, StatusBadge } from './ui.jsx';
+import { whenOf } from '../time.js';
+import { Alert, Card, Modal, Pager, Spinner, StatusBadge, Toast } from './ui.jsx';
+import { clipboardText, copiedMessage, labelFor, manualCopyMessage, queuedCopy, sessionSentNames } from '../sentNames.js';
 
 export default function ComposePage({ smtp, onSmtpChanged }) {
   const [workbook, setWorkbook] = useState(null);
@@ -11,6 +13,22 @@ export default function ComposePage({ smtp, onSmtpChanged }) {
   const [view, setView] = useState({ q: '', page: 1 }); // search + page of the attorney list
   const [loadingRecords, setLoadingRecords] = useState(false);
   const seq = useRef(0);
+  const [toast, setToast] = useState(null);
+  const closeToast = useCallback(() => setToast(null), []);
+
+  // Called ONLY after the server confirmed the email was accepted by the email
+  // service. Adds the attorney to this browser's cumulative list and copies it.
+  const onConfirmedSend = useCallback(async (who) => {
+    const list = sessionSentNames.add(labelFor(who));
+    if (!list.length) return;
+    const copied = await queuedCopy(clipboardText(list));
+    setToast(copied ? { type: 'success', text: copiedMessage(list) } : { type: 'warning', text: manualCopyMessage(list), list });
+  }, []);
+
+  const copyManually = async () => {
+    const list = sessionSentNames.list();
+    if (await queuedCopy(clipboardText(list))) setToast({ type: 'success', text: copiedMessage(list) });
+  };
 
   // Only one page (10 records) is ever fetched; search runs on the server over the whole workbook.
   const loadRecords = useCallback(async ({ q, page }) => {
@@ -35,15 +53,22 @@ export default function ComposePage({ smtp, onSmtpChanged }) {
   const dirty = selected && (draft.subject !== selected.subject || draft.body !== selected.body);
 
   const selectRow = async (rowNumber, listNumber) => {
-    if (selected?.rowNumber === rowNumber) return;
+    // Re-select the same row only if the list now belongs to a different workbook/mapping.
+    const sameVersion = selected?.workbookVersion === workbook?.workbookVersion && selected?.mappingVersion === workbook?.mappingVersion;
+    if (selected?.rowNumber === rowNumber && sameVersion) return;
     if (dirty && !window.confirm('You have edited this email. Discard your changes and select another attorney?')) return;
     setNotice(null);
     try {
-      const preview = await api('/api/preview', { method: 'POST', json: { rowNumber } });
+      // Send the versions of the list that was clicked: the server refuses if another
+      // team member has replaced the workbook or changed the mapping since.
+      const preview = await api('/api/preview', {
+        method: 'POST',
+        json: { rowNumber, workbookVersion: workbook?.workbookVersion, mappingVersion: workbook?.mappingVersion },
+      });
       setSelected({ ...preview, recordNumber: preview.recordNumber ?? listNumber });
       setDraft({ subject: preview.subject, body: preview.body });
     } catch (err) {
-      setNotice({ type: 'error', text: err.message });
+      setNotice({ type: 'error', text: err.message, stale: err.code === 'STALE_SELECTION' });
     }
   };
 
@@ -73,7 +98,12 @@ export default function ComposePage({ smtp, onSmtpChanged }) {
         )}
       </div>
       <div className="compose-right">
-        {notice && <Alert type={notice.type} onClose={() => setNotice(null)}>{notice.text}</Alert>}
+        {notice && (
+          <Alert type={notice.type} onClose={() => setNotice(null)}>
+            {notice.text}
+            {notice.stale && <ReloadButton />}
+          </Alert>
+        )}
         <EmailCard
           smtp={smtp}
           selected={selected}
@@ -81,9 +111,20 @@ export default function ComposePage({ smtp, onSmtpChanged }) {
           setDraft={setDraft}
           onReset={() => selected && setDraft({ subject: selected.subject, body: selected.body })}
           onSent={() => loadRecords(view)}
+          onConfirmedSend={onConfirmedSend}
           onSmtpChanged={onSmtpChanged}
         />
       </div>
+      <Toast toast={toast} onClose={closeToast}>
+        {toast?.list && (
+          <>
+            <textarea readOnly rows={Math.min(8, toast.list.length + 1)} value={clipboardText(toast.list)} onFocus={(e) => e.target.select()} aria-label="Sent attorney names" />
+            <div className="row-actions">
+              <button className="btn btn-small btn-primary" onClick={copyManually}>Copy names</button>
+            </div>
+          </>
+        )}
+      </Toast>
     </div>
   );
 }
@@ -293,7 +334,7 @@ function RecordsCard({ workbook, view, setView, busy, selectedRow, onSelect }) {
                   {r.problems?.length ? (
                     <span className="badge badge-warn" title={r.problems.join(', ')}>{r.problems[0]}</span>
                   ) : r.sentCount ? (
-                    <span className="badge badge-sent">Sent{r.sentCount > 1 ? ` ×${r.sentCount}` : ''}</span>
+                    <span className="badge badge-sent">{r.sentInfo?.lastMethod === 'Manual' ? 'Sent (manual)' : `Sent${r.sentCount > 1 ? ` ×${r.sentCount}` : ''}`}</span>
                   ) : r.possiblySent ? (
                     <span className="badge badge-warn" title="An email to this address is already in the sending history under a different record.">Possibly sent</span>
                   ) : r.sentCount === 0 ? (
@@ -327,9 +368,10 @@ function RecordsCard({ workbook, view, setView, busy, selectedRow, onSelect }) {
 }
 
 // ---------------------------------------------------------------------------
-function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onSmtpChanged }) {
-  const [stage, setStage] = useState('idle'); // idle | checking | duplicate | possible | confirmResend | sending
+function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onConfirmedSend, onSmtpChanged }) {
+  const [stage, setStage] = useState('idle'); // idle | checking | duplicate | possible | uncertain | confirmResend | sending
   const [previous, setPrevious] = useState([]);
+  const [uncertain, setUncertain] = useState([]);
   const [dupKind, setDupKind] = useState('exact'); // exact | possible
   const [result, setResult] = useState(null);
   const requestIdRef = useRef(null);
@@ -364,14 +406,35 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onSmtpCha
     setStage(kind === 'exact' ? 'duplicate' : 'possible');
   };
 
+  // What the user selected and previewed. The server only sends if this is still
+  // exactly the same attorney and recipient in the current workbook and mapping.
+  const selection = () => ({
+    workbookVersion: selected.workbookVersion,
+    mappingVersion: selected.mappingVersion,
+    recordId: selected.recordId,
+    recipientEmail: selected.recipientEmail,
+  });
+
+  // An earlier send with an unknown outcome: it is never resent until a team
+  // member has checked the provider and recorded the result in Sent History.
+  const showUncertain = (list) => {
+    setUncertain(list || []);
+    setStage('uncertain');
+  };
+
   const handleError = (err) => {
+    if (err.code === 'UNCERTAIN_UNRESOLVED') {
+      requestIdRef.current = null;
+      onSent(); // refresh the lists: the record may have just been created by recovery
+      return showUncertain(err.details?.uncertain);
+    }
     if (err.code === 'ALREADY_SENT') return showDuplicate('exact', err.details?.previous);
     if (err.code === 'POSSIBLE_DUPLICATE') return showDuplicate('possible', err.details?.possible);
     if (['SMTP_AUTH_FAILED', 'SMTP_NOT_CONFIGURED'].includes(err.code)) onSmtpChanged();
     // Keep the request ID only when we don't know whether the server finished,
     // so a retry can never send twice.
     if (err.code !== 'BACKEND_UNAVAILABLE') requestIdRef.current = null;
-    setResult({ type: 'error', text: err.message });
+    setResult({ type: 'error', text: err.message, stale: err.code === 'STALE_SELECTION' });
     setStage('idle');
     onSent(); // failed and uncertain attempts are recorded in the history too
   };
@@ -383,13 +446,16 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onSmtpCha
     try {
       const res = await api('/api/send', {
         method: 'POST',
-        json: { rowNumber: selected.rowNumber, subject: draft.subject, body: draft.body, confirmResend, requestId: requestIdRef.current },
+        json: { rowNumber: selected.rowNumber, subject: draft.subject, body: draft.body, confirmResend, requestId: requestIdRef.current, expected: selection() },
       });
       requestIdRef.current = null;
       // Short confirmation only; the full details are recorded in Sent History.
       setResult({ type: 'success', text: 'Email sent successfully!', warning: res.historySaved ? null : res.historyWarning });
       setStage('idle');
       onSent();
+      // Reached only when the server confirmed acceptance (failures, uncertain,
+      // duplicate, stale and in-progress replies all go to the catch below).
+      if (res?.accepted === true) onConfirmedSend({ attorneyName: selected.attorneyName, recipientEmail: selected.recipientEmail });
     } catch (err) {
       handleError(err);
     }
@@ -400,7 +466,8 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onSmtpCha
     setStage('checking');
     setResult(null);
     try {
-      const check = await api('/api/history/check', { method: 'POST', json: { rowNumber: selected.rowNumber } });
+      const check = await api('/api/history/check', { method: 'POST', json: { rowNumber: selected.rowNumber, expected: selection() } });
+      if (check.uncertainUnresolved) return showUncertain(check.uncertain);
       if (check.alreadySent) return showDuplicate('exact', check.previous);
       if (check.possibleDuplicate) return showDuplicate('possible', check.possible);
       await send(false);
@@ -470,7 +537,10 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onSmtpCha
       )}
       {result?.warning && <Alert type="warning">{result.warning}</Alert>}
       {result?.type === 'error' && (
-        <Alert type="error" onClose={() => setResult(null)}>{result.text}</Alert>
+        <Alert type="error" onClose={() => setResult(null)}>
+          {result.text}
+          {result.stale && <ReloadButton />}
+        </Alert>
       )}
 
       <div className="send-bar">
@@ -510,11 +580,45 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onSmtpCha
               <tbody>
                 {previous.map((p, i) => (
                   <tr key={i}>
-                    <td className="nowrap">{p.sentAt}</td>
+                    <td className="nowrap">{whenOf(p)}{p.sendMethod === 'Manual' && <span className="sub-line">Marked as sent manually{p.operator ? ` by ${p.operator}` : ''}</span>}</td>
                     {stage === 'possible' && <td>{p.attorneyName}{p.firmName && <span className="sub-line">{p.firmName}</span>}</td>}
                     <td className="email-cell">{p.recipientEmail}</td>
                     <td><StatusBadge status={p.status} />{p.pendingSave ? ' (not yet in Excel)' : ''}</td>
                     <td>{p.sendType}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
+      )}
+
+      {stage === 'uncertain' && (
+        <Modal
+          title="The last email to this attorney has an unknown outcome"
+          tone="warning"
+          onCancel={cancelSend}
+          actions={<button className="btn btn-primary" onClick={cancelSend} data-autofocus>Close</button>}
+        >
+          <p>
+            An earlier send to <strong>{selected.recipientEmail}</strong> is recorded as <strong>Uncertain</strong>: the connection or the server failed while it was
+            being sent, so it may or may not have arrived. To avoid a duplicate, it is <strong>not sent again</strong> until someone has checked.
+          </p>
+          <ol className="small">
+            <li>Look the email up at the provider: the <strong>Resend dashboard → Emails</strong> (search the recipient), or the <strong>Sent</strong> folder in Hostinger Webmail.</li>
+            <li>Open <strong>Sent History → Send log</strong>, click <strong>Correct…</strong> on that entry and choose “It was sent” or “It was not sent”, with a short reason.</li>
+            <li>If it was not sent, come back here and send it.</li>
+          </ol>
+          <div className="table-wrap">
+            <table className="table">
+              <thead><tr><th>Sent at</th><th>Recipient</th><th>Method</th><th>By</th></tr></thead>
+              <tbody>
+                {uncertain.map((p, i) => (
+                  <tr key={p.id || i}>
+                    <td className="nowrap">{whenOf(p)}</td>
+                    <td className="email-cell">{p.recipientEmail}</td>
+                    <td>{p.sendMethod || '—'}</td>
+                    <td>{p.operator || '—'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -542,5 +646,14 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onSmtpCha
         </Modal>
       )}
     </Card>
+  );
+}
+
+/** Offered when another team member replaced the workbook or changed the mapping. */
+function ReloadButton() {
+  return (
+    <div className="row-actions">
+      <button className="btn btn-small btn-primary" onClick={() => window.location.reload()}>Reload page</button>
+    </div>
   );
 }

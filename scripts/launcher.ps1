@@ -6,9 +6,18 @@ param([ValidateSet('start', 'stop')][string]$Action = 'start', [switch]$NoBrowse
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Logs = Join-Path $Root 'logs'
-$AppUrl = 'http://localhost:5173'
+# Ports come from backend\.env (PORT and FRONTEND_URL), like the backend and the
+# Vite config, so a second copy of the app can run next to this one.
 $BackendPort = 4000
 $FrontendPort = 5173
+$EnvFile = Join-Path $Root 'backend\.env'
+if (Test-Path $EnvFile) {
+    foreach ($line in Get-Content $EnvFile) {
+        if ($line -match '^\s*PORT\s*=\s*(\d+)\s*$') { $BackendPort = [int]$Matches[1] }
+        if ($line -match '^\s*FRONTEND_URL\s*=\s*["'']?https?://[^:/]+:(\d+)') { $FrontendPort = [int]$Matches[1] }
+    }
+}
+$AppUrl = "http://localhost:$FrontendPort"
 $BackendScript = Join-Path $Root 'backend\src\server.js'
 $ViteScript = Join-Path $Root 'frontend\node_modules\vite\bin\vite.js'
 

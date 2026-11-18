@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { isValidPasswordHash } from './auth.js';
+import { parseTeamMembers } from './audit.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const BACKEND_ROOT = path.resolve(__dirname, '..');
@@ -61,9 +62,41 @@ export function loadConfig(env = process.env) {
   const dataDir = explicitDataDir || DEFAULT_DATA_DIR;
   if (explicitDataDir && isProduction && !path.posix.isAbsolute(dataDir) && !path.isAbsolute(dataDir)) fatal.push('DATA_DIR must be an absolute path (e.g. /var/data).');
   const persistentStorage = Boolean(explicitDataDir) || !isProduction;
-  const storageWarning = persistentStorage
-    ? null
-    : 'Temporary storage: sending history, the email template, the column mapping and sign-in sessions are lost whenever the server restarts, sleeps or is redeployed. Duplicate warnings only cover emails sent since the last restart.';
+  // Shared permanent database (MongoDB Atlas). Optional: without it the app keeps
+  // using the files above. The connection string is never logged or sent to the browser.
+  const mongodbUri = String(env.MONGODB_URI ?? '').trim();
+  let mongodb = null;
+  if (mongodbUri) {
+    if (!/^mongodb(\+srv)?:\/\//.test(mongodbUri)) fatal.push('MONGODB_URI must start with mongodb:// or mongodb+srv://');
+    else mongodb = { uri: mongodbUri, dbName: clean(env.MONGODB_DB) || 'zodiacpatent' };
+  }
+  // Optional: remove team-activity entries older than this many days (off when
+  // unset; at least 90). The sending history is never removed automatically.
+  const retentionRaw = Number(String(env.ACTIVITY_RETENTION_DAYS ?? '').trim());
+  if (mongodb && Number.isFinite(retentionRaw) && retentionRaw > 0) {
+    if (retentionRaw < 90) warnings.push('ACTIVITY_RETENTION_DAYS is below the minimum of 90; 90 days is used.');
+    mongodb.activityRetentionDays = Math.max(90, Math.round(retentionRaw));
+  }
+  // Names team members choose from in each browser session (self-declared).
+  const teamMembers = parseTeamMembers(env.TEAM_MEMBERS);
+  // REQUIRE_MONGODB=true (set in render.yaml): never fall back to file storage.
+  // Without it a forgotten MONGODB_URI would quietly run on temporary files.
+  const requireMongo = parseBool(env.REQUIRE_MONGODB, false);
+  if (requireMongo && !mongodbUri) fatal.push('MONGODB_URI is not set, but REQUIRE_MONGODB=true: this deployment must use the shared MongoDB database.');
+  if (mongodb && (isProduction || requireMongo)) {
+    // No assumed values in production: the database name and team must be stated.
+    if (!clean(env.MONGODB_DB)) fatal.push('MONGODB_DB must be set to the database name (e.g. automail) when MONGODB_URI is used in production.');
+    if (!String(env.TEAM_MEMBERS || '').trim()) fatal.push('TEAM_MEMBERS must list the team members (comma-separated) when MONGODB_URI is used in production.');
+  }
+  // Proxies in front of the backend, for the activity log's reported client IP
+  // (production: Vercel + Render's load balancer).
+  const hopsRaw = Number.parseInt(String(env.AUDIT_CLIENT_IP_HOPS ?? ''), 10);
+  const clientIpHops = Number.isInteger(hopsRaw) && hopsRaw >= 0 && hopsRaw <= 5 ? hopsRaw : isProduction ? 2 : 0;
+
+  const storageWarning =
+    persistentStorage || mongodb
+      ? null
+      : 'Temporary storage: sending history, the email template, the column mapping and sign-in sessions are lost whenever the server restarts, sleeps or is redeployed. Duplicate warnings only cover emails sent since the last restart.';
 
   // Host names this server answers to (besides localhost). Render's own
   // *.onrender.com host name is added automatically.
@@ -146,6 +179,9 @@ export function loadConfig(env = process.env) {
     explicitDataDir: Boolean(explicitDataDir),
     persistentStorage,
     storageWarning,
+    mongodb,
+    teamMembers,
+    clientIpHops,
     auth,
     fatal,
     smtp: { host, port: smtpPort, secure, user, pass, from },

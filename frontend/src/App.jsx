@@ -1,17 +1,27 @@
-import { useCallback, useEffect, useState } from 'react';
-import { api, setAuthRequiredHandler, setCsrfToken } from './api.js';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { api, setAuthRequiredHandler, setCsrfToken, setOperatorRequiredHandler } from './api.js';
 import LoginForm from './components/LoginForm.jsx';
+import { sessionSentNames } from './sentNames.js';
 import SmtpStatus from './components/SmtpStatus.jsx';
 import ComposePage from './components/ComposePage.jsx';
 import TemplatePage from './components/TemplatePage.jsx';
 import HistoryPage from './components/HistoryPage.jsx';
+import SentEmailsPage from './components/SentEmailsPage.jsx';
+import AllAttorneysPage from './components/AllAttorneysPage.jsx';
+import { OperatorPrompt, OperatorSelect } from './components/OperatorPicker.jsx';
+import { getOperator, knownOperator, setOperator } from './operator.js';
 import { Alert, Spinner } from './components/ui.jsx';
 
 const TABS = [
   { id: 'compose', label: 'Compose Email' },
+  { id: 'sent', label: 'Sent Emails' },
+  { id: 'attorneys', label: 'All Attorneys' },
   { id: 'template', label: 'Template Settings' },
   { id: 'history', label: 'Sent History' },
 ];
+
+/** Extra attempts (1 s, 2 s, 4 s apart) to load the app settings, e.g. while Render is waking up. */
+const CONFIG_RETRIES = 3;
 
 /**
  * Shared team sign-in gate. When the backend has login enabled, nothing else is
@@ -59,6 +69,8 @@ export default function App() {
       /* the session is cleared below either way */
     }
     setCsrfToken(null);
+    sessionSentNames.clear(); // a new sign-in starts a new list of sent names
+    setOperator(null); // and asks again who is using this browser
     setWorkspaceShown(false);
     setAuth({ state: 'signin', message: 'You have signed out.' });
   };
@@ -97,6 +109,62 @@ function Workspace({ auth, onSignOut }) {
   const [testing, setTesting] = useState(false);
   const [banner, setBanner] = useState(null);
   const [backendError, setBackendError] = useState(null);
+  const [appConfig, setAppConfig] = useState(null);
+  const [configError, setConfigError] = useState(null);
+  const configLoad = useRef(0);
+
+  // Capabilities of this server (file storage or the shared MongoDB database).
+  // A failed request is retried and, if it keeps failing, reported with a Retry
+  // button. It is never treated as "file storage": that hid the operator prompt
+  // while the server still required an operator for every action.
+  const loadConfig = useCallback(async () => {
+    const run = ++configLoad.current;
+    setConfigError(null);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const cfg = await api('/api/app/config');
+        if (run === configLoad.current) setAppConfig(cfg);
+        return;
+      } catch (err) {
+        if (run !== configLoad.current) return; // superseded or unmounted
+        if (err.code === 'AUTH_REQUIRED' || attempt >= CONFIG_RETRIES) {
+          setConfigError(err.message);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+      }
+    }
+  }, []);
+  useEffect(() => {
+    loadConfig();
+    return () => {
+      configLoad.current += 1; // stop retries after unmount
+    };
+  }, [loadConfig]);
+  // Signed in again after the session ended while settings were still missing.
+  useEffect(() => {
+    if (auth.state === 'ready' && configError) loadConfig();
+  }, [auth.state]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const operatorRequired = Boolean(appConfig?.features?.operatorRequired);
+  const teamMembers = appConfig?.teamMembers;
+
+  // A stored name the server does not accept (e.g. the team list changed) is cleared, so the prompt asks again.
+  useEffect(() => {
+    if (!operatorRequired) return;
+    const op = getOperator();
+    if (op && !knownOperator(op, teamMembers)) setOperator(null);
+    else if (op && knownOperator(op, teamMembers) !== op) setOperator(knownOperator(op, teamMembers));
+  }, [operatorRequired, teamMembers]);
+
+  // The server refused an action for lack of a valid operator: ask again, with the current team list.
+  useEffect(() => {
+    setOperatorRequiredHandler(() => {
+      setOperator(null);
+      loadConfig();
+    });
+    return () => setOperatorRequiredHandler(null);
+  }, [loadConfig]);
 
   const refreshSmtp = useCallback(async () => {
     try {
@@ -143,6 +211,15 @@ function Workspace({ auth, onSignOut }) {
           </span>
         </div>
         <div className="topbar-right">
+          {appConfig && (
+            <span
+              className={`storage-badge ${appConfig.storage === 'mongodb' ? 'storage-db' : 'storage-file'}`}
+              title={appConfig.storage === 'mongodb' ? 'History, workbook and activity are saved in the shared MongoDB database.' : 'History is saved in a local Excel file on this server.'}
+            >
+              {appConfig.storage === 'mongodb' ? `Shared database: ${appConfig.database || 'MongoDB'}` : 'Local files'}
+            </span>
+          )}
+          {operatorRequired && <OperatorSelect teamMembers={appConfig.teamMembers} />}
           <SmtpStatus smtp={smtp} testing={testing} onTest={testConnection} />
           {auth.required && (
             <span className="session-info">
@@ -162,6 +239,12 @@ function Workspace({ auth, onSignOut }) {
       </nav>
 
       <main className="content">
+        {configError && (
+          <Alert type="error" onClose={() => setConfigError(null)}>
+            The application settings could not be loaded, so the team member selection is not available yet. {configError}{' '}
+            <button className="link-button" onClick={loadConfig}>Retry</button>
+          </Alert>
+        )}
         {backendError && (
           <Alert type="error" onClose={() => setBackendError(null)}>
             {backendError}{' '}
@@ -187,13 +270,20 @@ function Workspace({ auth, onSignOut }) {
         <div hidden={tab !== 'compose'}>
           <ComposePage smtp={smtp} onSmtpChanged={refreshSmtp} active={tab === 'compose'} />
         </div>
+        <div hidden={tab !== 'sent'}>
+          <SentEmailsPage active={tab === 'sent'} />
+        </div>
+        <div hidden={tab !== 'attorneys'}>
+          <AllAttorneysPage active={tab === 'attorneys'} appConfig={appConfig} />
+        </div>
         <div hidden={tab !== 'template'}>
           <TemplatePage active={tab === 'template'} />
         </div>
         <div hidden={tab !== 'history'}>
-          <HistoryPage active={tab === 'history'} />
+          <HistoryPage active={tab === 'history'} appConfig={appConfig} />
         </div>
       </main>
+      {operatorRequired && <OperatorPrompt teamMembers={appConfig.teamMembers} />}
     </div>
   );
 }

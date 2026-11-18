@@ -3,6 +3,7 @@ import path from 'node:path';
 import { loadConfigFromEnvFile } from './config.js';
 import { createApp } from './app.js';
 import { createMailer } from './mailer.js';
+import { createStorage } from './storage/index.js';
 
 const config = loadConfigFromEnvFile();
 const where = config.isProduction ? 'the Render environment variables' : 'backend/.env';
@@ -54,7 +55,55 @@ if (mailer && config.email.provider === 'resend') {
   for (const p of config.problems) console.warn(`  - ${p}`);
 }
 
-const app = createApp({ config, dataDir, mailer });
+// Shared database (MongoDB Atlas) when MONGODB_URI is set; otherwise the files above.
+const storage = createStorage(config, dataDir);
+if (storage.kind === 'mongodb') {
+  console.log(`[db] Using MongoDB database "${config.mongodb.dbName}" for shared, permanent data (team members: ${config.teamMembers.join(', ')})`);
+  if (config.isProduction) {
+    // Production: connect BEFORE accepting requests. If the database can't be
+    // reached (wrong password, Atlas Network Access not allowing Render, cluster
+    // paused), stop with a clear message: Render then marks the deploy as failed
+    // and keeps the previous version running, instead of serving a broken app.
+    let lastError = null;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      try {
+        await storage.init();
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err;
+        console.error(`[db] Could not connect to MongoDB (attempt ${attempt} of 4: ${err?.name || 'error'}${err?.codeName ? ` ${err.codeName}` : ''})`);
+        if (attempt < 4) await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+    if (lastError) {
+      const auth = /auth/i.test(`${lastError?.codeName || ''} ${lastError?.message || ''}`);
+      console.error(
+        `[db] The server cannot start without the database. ${auth ? 'The database user or password in MONGODB_URI was rejected.' : 'Check MONGODB_URI, and that Atlas Network Access allows connections from Render (0.0.0.0/0 on the free plan).'}`,
+      );
+      process.exit(1);
+    }
+    console.log('[db] Connected; indexes are in place');
+  } else {
+    // Locally the app still starts if Atlas is briefly unreachable (actions that
+    // need the database then say so and retry).
+    storage.init().then(
+      () => console.log('[db] Connected; indexes are in place'),
+      (err) => console.error(`[db] Could not connect to MongoDB yet (${err?.name || 'error'}). Sending and recording are refused until it is reachable.`),
+    );
+  }
+  // Recovery of send claims, including those left by a previous run of this
+  // server or by another process: finished sends whose history write failed are
+  // recorded, and sends interrupted by a stopped server become "Uncertain" (never
+  // resent automatically). Runs shortly after start-up, then every minute.
+  const sweep = () => storage.locks.sweep().then((n) => n && console.warn(`[db] Recovered ${n} unfinished send claim(s); see Team Activity`)).catch(() => {});
+  setTimeout(sweep, 5000).unref();
+  setInterval(sweep, 60 * 1000).unref();
+} else {
+  console.log('[storage] Using local files (MONGODB_URI is not set)');
+}
+
+const app = createApp({ config, dataDir, mailer, storage });
 
 const server = app.listen(config.port, config.host, () => {
   console.log(`Backend listening on ${config.host}:${config.port}`);
@@ -68,7 +117,7 @@ server.on('error', (err) => {
 // Render sends SIGTERM before stopping the instance: finish in-flight requests
 // (including an email being sent and its history write) before exiting.
 const shutdown = () => {
-  server.close(() => process.exit(0));
+  server.close(() => storage.close().finally(() => process.exit(0)));
   setTimeout(() => process.exit(0), 25000).unref();
 };
 process.on('SIGINT', shutdown);

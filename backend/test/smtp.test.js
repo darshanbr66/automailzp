@@ -57,6 +57,9 @@ test('SMTP errors are mapped to clear messages', () => {
   assert.match(mapSmtpError(smtpError('ETLS', { command: 'CONN' }), 'verify', smtp).message, /SSL\/TLS/);
   assert.equal(mapSmtpError(smtpError('ETIMEDOUT', { command: 'CONN' }), 'send', smtp).code, 'SMTP_CONNECTION_FAILED');
   assert.equal(mapSmtpError(smtpError('ESOCKET', {}), 'send', smtp).code, 'SMTP_UNCERTAIN');
+  // A raw connection reset while the message is transmitted may still have delivered it.
+  assert.equal(mapSmtpError(smtpError('ECONNRESET', { command: 'DATA' }), 'send', smtp).code, 'SMTP_UNCERTAIN');
+  assert.equal(mapSmtpError(smtpError('ECONNRESET', { command: 'MAIL FROM' }), 'send', smtp).code, 'SMTP_CONNECTION_FAILED');
   assert.equal(mapSmtpError(new Error('weird'), 'send', smtp).code, 'SMTP_ERROR');
 });
 
