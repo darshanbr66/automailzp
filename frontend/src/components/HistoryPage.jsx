@@ -40,6 +40,7 @@ const ACTION_LABELS = {
   email_failed: 'Send failed',
   email_uncertain: 'Send uncertain',
   send_uncertain_recovered: 'Interrupted send recorded as uncertain',
+  send_outcome_recovered: 'Provider-confirmed send recorded by recovery',
   manual_mark_sent: 'Marked as sent (manual)',
   history_corrected: 'History corrected',
   workbook_uploaded: 'Workbook uploaded',
@@ -47,6 +48,7 @@ const ACTION_LABELS = {
   template_updated: 'Template updated',
   mapping_updated: 'Column mapping updated',
   data_migrated: 'Data migrated',
+  migration_rolled_back: 'Migration rolled back',
 };
 
 function ActivityView({ active }) {
@@ -121,7 +123,9 @@ function ActivityView({ active }) {
 
 function CorrectionModal({ entry, onClose, onDone }) {
   const operator = useOperator();
-  const [action, setAction] = useState(entry.status === 'Uncertain' ? 'confirm-not-sent' : 'void');
+  const undoable = Boolean(entry.voided || entry.resolution);
+  const isUncertain = entry.status === 'Uncertain' && !entry.voided;
+  const [action, setAction] = useState(undoable ? 'undo' : isUncertain ? 'confirm-not-sent' : 'void');
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -155,14 +159,29 @@ function CorrectionModal({ entry, onClose, onDone }) {
       </dl>
       <div className="field">
         <span className="field-label">Correction</span>
-        {entry.status === 'Uncertain' && (
+        {undoable && (
+          <label className="operator-choice">
+            <input type="radio" checked={action === 'undo'} onChange={() => setAction('undo')} />{' '}
+            {entry.voided ? <>Undo the void (the record counts as sent again)</> : <>Undo the confirmation “{entry.resolution?.resolvedAs}” (the send becomes “Uncertain” again)</>}
+          </label>
+        )}
+        {isUncertain && (
           <>
-            <label className="operator-choice"><input type="radio" checked={action === 'confirm-not-sent'} onChange={() => setAction('confirm-not-sent')} /> It was <strong>not</strong> sent (becomes “Failed”)</label>
+            <label className="operator-choice"><input type="radio" checked={action === 'confirm-not-sent'} onChange={() => setAction('confirm-not-sent')} /> It was <strong>not</strong> sent (becomes “Failed”; the attorney can be emailed again)</label>
             <label className="operator-choice"><input type="radio" checked={action === 'confirm-sent'} onChange={() => setAction('confirm-sent')} /> It <strong>was</strong> sent (becomes “Success”)</label>
           </>
         )}
-        <label className="operator-choice"><input type="radio" checked={action === 'void'} onChange={() => setAction('void')} /> Void this record (recorded by mistake; it stops counting as sent)</label>
+        {!entry.voided && !isUncertain && (
+          <label className="operator-choice"><input type="radio" checked={action === 'void'} onChange={() => setAction('void')} /> Void this record (recorded by mistake; it stops counting as sent)</label>
+        )}
       </div>
+      {isUncertain && (
+        <p className="small">
+          Check before you choose: in the <strong>Resend dashboard → Emails</strong>, search for {entry.recipientEmail}
+          {entry.requestId ? <> (the request is identified by the idempotency key <code>zp-send-{entry.requestId}</code>)</> : null}; for Hostinger, look in the Sent folder.
+          An Uncertain send is never repeated automatically.
+        </p>
+      )}
       <label className="field">
         <span className="field-label">Reason (required, kept in the activity log)</span>
         <input type="text" maxLength={500} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Marked the wrong attorney" />
@@ -363,7 +382,7 @@ export default function HistoryPage({ active, appConfig }) {
                         {e.pendingSave && <span className="badge badge-warn" title="Waiting to be written to the shared history">Not yet saved</span>}
                       </td>
                       <td>{e.sendType === 'Resend' ? <span className="badge badge-warn">Resend</span> : e.sendType ? <span className="badge">{e.sendType}</span> : null}</td>
-                      {canCorrect && <td>{e.id && !e.voided && <button className="btn btn-small btn-ghost" onClick={() => setCorrecting(e)}>Correct…</button>}</td>}
+                      {canCorrect && <td>{e.id && !e.pendingSave && <button className="btn btn-small btn-ghost" onClick={() => setCorrecting(e)}>{e.voided || e.resolution ? 'Correct / undo…' : 'Correct…'}</button>}</td>}
                     </tr>
                   ))}
                   {!visible.length && <tr><td colSpan={canCorrect ? 10 : 9} className="empty">{entries.length ? 'No entries match your filters.' : 'No emails have been sent yet.'}</td></tr>}

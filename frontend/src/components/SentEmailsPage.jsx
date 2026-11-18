@@ -77,7 +77,7 @@ function Stats({ stats }) {
       </div>
       {stats.inProgress?.length > 0 && (
         <Alert type="info">
-          Being sent right now: {stats.inProgress.map((p) => p.attorneyName || p.recipientEmail).join(', ')}. If a send was interrupted, it is recorded as “Uncertain” automatically after 10 minutes.
+          Being sent right now: {stats.inProgress.map((p) => p.attorneyName || p.recipientEmail).join(', ')}. If a server stopped or lost the database mid-send, the outcome is recorded automatically within a few minutes: “Success” when the provider had confirmed it, otherwise “Uncertain” (never resent until someone checks).
         </Alert>
       )}
     </>

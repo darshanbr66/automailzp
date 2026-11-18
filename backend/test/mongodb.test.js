@@ -170,7 +170,7 @@ test('operator is required (self-declared, from the configured list) for audited
     assert.equal(s.data.error.code, 'OPERATOR_REQUIRED');
     assert.equal(a.smtp.state.sent.length, 0);
     const cfg = (await a.srv.request('GET', '/api/app/config')).data.data;
-    assert.deepEqual(cfg, { storage: 'mongodb', features: cfg.features, teamMembers: ['Team Member 1', 'Team Member 2'], operatorIdentification: 'self-declared', historyLabel: 'MongoDB collection "email_history"' });
+    assert.deepEqual(cfg, { storage: 'mongodb', features: cfg.features, teamMembers: ['Team Member 1', 'Team Member 2'], operatorIdentification: 'self-declared', database: name, historyLabel: 'MongoDB collection "email_history"' });
     assert.ok(!JSON.stringify(cfg).includes('mongodb://'));
   } finally {
     await a.srv.close();
@@ -232,7 +232,10 @@ test('failed and uncertain sends are recorded with their activity; never as Succ
     assert.equal(stats.totalSent, 0);
     assert.equal(stats.failed, 1);
     assert.equal(stats.uncertain, 1);
-    assert.equal((await send(a.srv, 3)).data.error.code, 'ALREADY_SENT', 'uncertain still blocks a repeat');
+    assert.equal((await send(a.srv, 3)).data.error.code, 'UNCERTAIN_UNRESOLVED', 'uncertain still blocks a repeat');
+    assert.equal((await send(a.srv, 3, { confirmResend: true })).data.error.code, 'UNCERTAIN_UNRESOLVED', '"Send again" does not override it');
+    assert.equal(a.smtp.state.sent.length, 0);
+    assert.equal((await a.srv.request('GET', '/api/stats')).data.data.inProgress.length, 0, 'no claims are left behind');
   } finally {
     await a.srv.close();
   }
@@ -329,7 +332,8 @@ test('a send interrupted by a stopped server is recorded as Uncertain (never los
     await a.srv.upload(makeWorkbookBuffer(SAMPLE_ROWS));
     // Simulate a process that claimed the attorney and then died mid-send.
     const entry = { recordId: 'REG-001', attorneyName: 'Test Attorney One', recipientEmail: 'one@example.com', registrationNumber: 'REG-001', subject: 'S', sentAt: '2026-01-01 10:00:00', status: 'Uncertain', sendMethod: 'Resend', operator: 'Team Member 2', requestId: 'dead-process-request' };
-    await a.storage.locks.acquire({ recordKey: 'REG-001', emailKey: 'one@example.com', requestId: 'dead-process-request', kind: 'send', entry });
+    const claim = await a.storage.locks.acquire({ recordKey: 'REG-001', emailKey: 'one@example.com', requestId: 'dead-process-request', kind: 'send', entry });
+    await claim.begin({ sendType: 'First Send' }); // it had handed the email to the provider
     const blocked = await send(a.srv, 2);
     assert.equal(blocked.data.error.code, 'SEND_IN_PROGRESS', 'still blocked while the outcome is unknown');
     assert.equal(await a.storage.locks.sweep(Date.now()), 0, 'fresh claims are left alone');
@@ -337,7 +341,15 @@ test('a send interrupted by a stopped server is recorded as Uncertain (never los
     const h = (await a.srv.request('GET', '/api/history')).data.data.entries;
     assert.equal(h[0].status, 'Uncertain');
     assert.match(h[0].note, /server stopped/);
-    assert.equal((await send(a.srv, 2)).data.error.code, 'ALREADY_SENT', 'the uncertain record now triggers the duplicate warning');
+    assert.equal((await send(a.srv, 2)).data.error.code, 'UNCERTAIN_UNRESOLVED', 'the uncertain record blocks a repeat');
+    assert.equal(a.smtp.state.sent.length, 0);
+
+    // A claim whose process stopped BEFORE calling the provider is simply removed (nothing was sent).
+    const early = await a.storage.locks.acquire({ recordKey: 'REG-002', emailKey: 'two@example.com', requestId: 'dead-before-send', kind: 'send', entry: { ...entry, recordId: 'REG-002', registrationNumber: 'REG-002', recipientEmail: 'two@example.com' } });
+    assert.ok(early.id);
+    assert.equal(await a.storage.locks.sweep(Date.now() + LOCK_STALE_MS + 1000), 1);
+    assert.equal((await a.srv.request('GET', '/api/history')).data.data.entries.length, 1, 'no history row for a send that never started');
+    assert.equal((await send(a.srv, 3)).status, 200, 'that attorney can be emailed normally');
   } finally {
     await a.srv.close();
   }
@@ -354,13 +366,21 @@ test('if MongoDB fails after the email was sent, the record is kept locally and 
     const r = await send(a.srv, 2);
     assert.equal(r.status, 200, 'the email was sent, so the user is told so');
     assert.equal(r.data.data.historySaved, false);
-    assert.match(r.data.data.historyWarning, /kept on the server/);
+    assert.match(r.data.data.historyWarning, /stays blocked for everyone/);
     assert.equal(await d.collection(COLLECTIONS.history).countDocuments({ status: 'Success' }), 0);
-    // Still counts for duplicates meanwhile.
-    assert.equal((await send(a.srv, 2)).data.error.code, 'ALREADY_SENT');
+    const claim = await d.collection(COLLECTIONS.pending).findOne({});
+    assert.equal(claim.state, 'accepted', 'the claim is kept, with the provider confirmation');
+    assert.equal(claim.messageId, '<test-message@example.com>');
+    // Still blocked meanwhile (by the claim, for every process).
+    assert.equal((await send(a.srv, 2)).data.error.code, 'SEND_IN_PROGRESS');
     await d.command({ collMod: COLLECTIONS.history, validator: {} });
     await a.srv.request('GET', '/api/history'); // next read flushes the kept record
     assert.equal(await d.collection(COLLECTIONS.history).countDocuments({ status: 'Success' }), 1);
+    await a.storage.locks.sweep();
+    assert.equal(await d.collection(COLLECTIONS.history).countDocuments({}), 1, 'recorded exactly once (fallback and recovery agree)');
+    assert.equal(await d.collection(COLLECTIONS.pending).countDocuments({}), 0, 'claim removed once recorded');
+    assert.equal((await send(a.srv, 2)).data.error.code, 'ALREADY_SENT');
+    assert.equal(a.smtp.state.sent.length, 1);
   } finally {
     await a.srv.close();
   }

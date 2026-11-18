@@ -211,6 +211,14 @@ function Workspace({ auth, onSignOut }) {
           </span>
         </div>
         <div className="topbar-right">
+          {appConfig && (
+            <span
+              className={`storage-badge ${appConfig.storage === 'mongodb' ? 'storage-db' : 'storage-file'}`}
+              title={appConfig.storage === 'mongodb' ? 'History, workbook and activity are saved in the shared MongoDB database.' : 'History is saved in a local Excel file on this server.'}
+            >
+              {appConfig.storage === 'mongodb' ? `Shared database: ${appConfig.database || 'MongoDB'}` : 'Local files'}
+            </span>
+          )}
           {operatorRequired && <OperatorSelect teamMembers={appConfig.teamMembers} />}
           <SmtpStatus smtp={smtp} testing={testing} onTest={testConnection} />
           {auth.required && (

@@ -1,11 +1,15 @@
 # Render Blueprint – ZodiacPatent Attorney Email Automation (backend API)
 #
 # One Web Service on the FREE plan, without a persistent disk.
-# Without a disk, history, templates, column mapping and sessions are stored in
-# the app folder and are LOST on every restart, sleep (Free instances spin down
-# when idle) and redeploy. See DEPLOYMENT.md, "Render Free: what is not kept".
-# To keep data later: switch to a paid plan, add a disk at /var/data and set
-# DATA_DIR=/var/data (do NOT set DATA_DIR without a disk: the server will refuse to start).
+# Sending history, the shared workbook, template, column mapping, in-flight send
+# claims and team activity are stored in MongoDB Atlas (M0 Free), so they survive
+# restarts, sleep and redeploys. Only sign-in sessions live in the temporary app
+# folder: after a restart or sleep, team members simply sign in again.
+# REQUIRE_MONGODB=true makes the server refuse to start without the database,
+# and in production it connects BEFORE serving: a wrong MONGODB_URI, or Atlas
+# Network Access not allowing Render, fails the deploy (the previous version
+# keeps running) instead of going live broken.
+# Do NOT set DATA_DIR without a disk: the server would refuse to start.
 # Secrets marked "sync: false" are NOT stored here: Render asks for them when the
 # Blueprint is first applied (or set them under Service → Environment).
 # See DEPLOYMENT.md for the full procedure.
@@ -19,7 +23,8 @@ services:
     startCommand: node src/server.js
     healthCheckPath: /healthz
     autoDeploy: false        # deploy manually from the Render dashboard; see DEPLOYMENT.md to enable auto-deploy
-    # Run ONE instance only: the history workbook, locks and sessions assume a single process.
+    # One instance (the free plan's limit). Send claims and history are safe across
+    # instances (MongoDB), but sign-in sessions are kept per instance.
     envVars:
       - key: NODE_ENV
         value: production
@@ -60,3 +65,19 @@ services:
         sync: false
       - key: SMTP_FROM
         sync: false           # e.g. vikram@zodiacpatent.com
+      # Shared database (MongoDB Atlas M0 Free). The connection string is a secret:
+      # set it in the Render dashboard only. Atlas Network Access must allow
+      # 0.0.0.0/0 (Render Free has no fixed outgoing IP address).
+      - key: REQUIRE_MONGODB
+        value: "true"
+      - key: MONGODB_URI
+        sync: false           # mongodb+srv://<user>:<password>@<cluster>/?retryWrites=true&w=majority
+      - key: MONGODB_DB
+        value: automail
+      # Names offered in "Who is using this browser?" (self-declared, audited).
+      - key: TEAM_MEMBERS
+        value: Vikram, Vikram2
+      # Proxies in front of the backend for the activity log's reported client IP
+      # (Vercel's proxy + Render's load balancer).
+      - key: AUDIT_CLIENT_IP_HOPS
+        value: "2"

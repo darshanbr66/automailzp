@@ -369,8 +369,9 @@ function RecordsCard({ workbook, view, setView, busy, selectedRow, onSelect }) {
 
 // ---------------------------------------------------------------------------
 function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onConfirmedSend, onSmtpChanged }) {
-  const [stage, setStage] = useState('idle'); // idle | checking | duplicate | possible | confirmResend | sending
+  const [stage, setStage] = useState('idle'); // idle | checking | duplicate | possible | uncertain | confirmResend | sending
   const [previous, setPrevious] = useState([]);
+  const [uncertain, setUncertain] = useState([]);
   const [dupKind, setDupKind] = useState('exact'); // exact | possible
   const [result, setResult] = useState(null);
   const requestIdRef = useRef(null);
@@ -414,7 +415,19 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onConfirm
     recipientEmail: selected.recipientEmail,
   });
 
+  // An earlier send with an unknown outcome: it is never resent until a team
+  // member has checked the provider and recorded the result in Sent History.
+  const showUncertain = (list) => {
+    setUncertain(list || []);
+    setStage('uncertain');
+  };
+
   const handleError = (err) => {
+    if (err.code === 'UNCERTAIN_UNRESOLVED') {
+      requestIdRef.current = null;
+      onSent(); // refresh the lists: the record may have just been created by recovery
+      return showUncertain(err.details?.uncertain);
+    }
     if (err.code === 'ALREADY_SENT') return showDuplicate('exact', err.details?.previous);
     if (err.code === 'POSSIBLE_DUPLICATE') return showDuplicate('possible', err.details?.possible);
     if (['SMTP_AUTH_FAILED', 'SMTP_NOT_CONFIGURED'].includes(err.code)) onSmtpChanged();
@@ -454,6 +467,7 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onConfirm
     setResult(null);
     try {
       const check = await api('/api/history/check', { method: 'POST', json: { rowNumber: selected.rowNumber, expected: selection() } });
+      if (check.uncertainUnresolved) return showUncertain(check.uncertain);
       if (check.alreadySent) return showDuplicate('exact', check.previous);
       if (check.possibleDuplicate) return showDuplicate('possible', check.possible);
       await send(false);
@@ -571,6 +585,40 @@ function EmailCard({ smtp, selected, draft, setDraft, onReset, onSent, onConfirm
                     <td className="email-cell">{p.recipientEmail}</td>
                     <td><StatusBadge status={p.status} />{p.pendingSave ? ' (not yet in Excel)' : ''}</td>
                     <td>{p.sendType}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
+      )}
+
+      {stage === 'uncertain' && (
+        <Modal
+          title="The last email to this attorney has an unknown outcome"
+          tone="warning"
+          onCancel={cancelSend}
+          actions={<button className="btn btn-primary" onClick={cancelSend} data-autofocus>Close</button>}
+        >
+          <p>
+            An earlier send to <strong>{selected.recipientEmail}</strong> is recorded as <strong>Uncertain</strong>: the connection or the server failed while it was
+            being sent, so it may or may not have arrived. To avoid a duplicate, it is <strong>not sent again</strong> until someone has checked.
+          </p>
+          <ol className="small">
+            <li>Look the email up at the provider: the <strong>Resend dashboard → Emails</strong> (search the recipient), or the <strong>Sent</strong> folder in Hostinger Webmail.</li>
+            <li>Open <strong>Sent History → Send log</strong>, click <strong>Correct…</strong> on that entry and choose “It was sent” or “It was not sent”, with a short reason.</li>
+            <li>If it was not sent, come back here and send it.</li>
+          </ol>
+          <div className="table-wrap">
+            <table className="table">
+              <thead><tr><th>Sent at</th><th>Recipient</th><th>Method</th><th>By</th></tr></thead>
+              <tbody>
+                {uncertain.map((p, i) => (
+                  <tr key={p.id || i}>
+                    <td className="nowrap">{whenOf(p)}</td>
+                    <td className="email-cell">{p.recipientEmail}</td>
+                    <td>{p.sendMethod || '—'}</td>
+                    <td>{p.operator || '—'}</td>
                   </tr>
                 ))}
               </tbody>

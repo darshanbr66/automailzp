@@ -63,7 +63,8 @@ export function mapSmtpError(err, phase, smtp) {
     return new AppError(400, 'INVALID_RECIPIENT', `Hostinger rejected the recipient address.${notSent}${serverReply(err)}`);
   }
 
-  const isNetwork = ['ECONNECTION', 'ETIMEDOUT', 'ESOCKET', 'ETLS', 'EPROTOCOL', 'EHLO', 'ESTREAM'].includes(code);
+  // Raw socket errors are included: a connection reset during DATA may still have delivered the email.
+  const isNetwork = ['ECONNECTION', 'ETIMEDOUT', 'ESOCKET', 'ETLS', 'EPROTOCOL', 'EHLO', 'ESTREAM', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(code);
   if (isNetwork) {
     if (phase === 'send' && !PRE_DATA_COMMAND.test(command)) {
       // The connection broke while or after the message was transmitted.

@@ -314,6 +314,8 @@ npm run start:backend    # backend only (http://localhost:4000)
 npm run start:frontend   # Vite dev server (http://localhost:5173)
 ```
 
+MongoDB backup, restore, verification, reconciliation of "Uncertain" sends and the production migration procedure: see [DATABASE-OPERATIONS.md](DATABASE-OPERATIONS.md).
+
 **Architecture:** React (Vite) frontend → Vite dev proxy (`/api`) → Express backend on `127.0.0.1:4000` → Nodemailer → `smtp.hostinger.com:465` (implicit TLS, minimum TLS 1.2, SMTP AUTH with the App Password).
 
 **API (local only):** `GET /api/smtp/status` returns host, port, SSL flag, user, sender and the last test result (never the password). `POST /api/smtp/test` runs `transporter.verify()` (connect + login, no email). `POST /api/send` sends one email.

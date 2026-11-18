@@ -59,16 +59,46 @@ if (mailer && config.email.provider === 'resend') {
 const storage = createStorage(config, dataDir);
 if (storage.kind === 'mongodb') {
   console.log(`[db] Using MongoDB database "${config.mongodb.dbName}" for shared, permanent data (team members: ${config.teamMembers.join(', ')})`);
-  // Connect now so problems show up in the log; the app still starts if Atlas is
-  // briefly unreachable (actions that need the database then say so and retry).
-  storage.init().then(
-    () => console.log('[db] Connected; indexes are in place'),
-    (err) => console.error(`[db] Could not connect to MongoDB yet (${err?.name || 'error'}). Sending and recording are refused until it is reachable.`),
-  );
-  // Sends interrupted by a stopped server are recorded as "Uncertain" (never lost).
-  const sweep = () => storage.locks.sweep().then((n) => n && console.warn(`[db] Recorded ${n} interrupted send(s) as Uncertain`)).catch(() => {});
-  setTimeout(sweep, 15000).unref();
-  setInterval(sweep, 2 * 60 * 1000).unref();
+  if (config.isProduction) {
+    // Production: connect BEFORE accepting requests. If the database can't be
+    // reached (wrong password, Atlas Network Access not allowing Render, cluster
+    // paused), stop with a clear message: Render then marks the deploy as failed
+    // and keeps the previous version running, instead of serving a broken app.
+    let lastError = null;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      try {
+        await storage.init();
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err;
+        console.error(`[db] Could not connect to MongoDB (attempt ${attempt} of 4: ${err?.name || 'error'}${err?.codeName ? ` ${err.codeName}` : ''})`);
+        if (attempt < 4) await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+    if (lastError) {
+      const auth = /auth/i.test(`${lastError?.codeName || ''} ${lastError?.message || ''}`);
+      console.error(
+        `[db] The server cannot start without the database. ${auth ? 'The database user or password in MONGODB_URI was rejected.' : 'Check MONGODB_URI, and that Atlas Network Access allows connections from Render (0.0.0.0/0 on the free plan).'}`,
+      );
+      process.exit(1);
+    }
+    console.log('[db] Connected; indexes are in place');
+  } else {
+    // Locally the app still starts if Atlas is briefly unreachable (actions that
+    // need the database then say so and retry).
+    storage.init().then(
+      () => console.log('[db] Connected; indexes are in place'),
+      (err) => console.error(`[db] Could not connect to MongoDB yet (${err?.name || 'error'}). Sending and recording are refused until it is reachable.`),
+    );
+  }
+  // Recovery of send claims, including those left by a previous run of this
+  // server or by another process: finished sends whose history write failed are
+  // recorded, and sends interrupted by a stopped server become "Uncertain" (never
+  // resent automatically). Runs shortly after start-up, then every minute.
+  const sweep = () => storage.locks.sweep().then((n) => n && console.warn(`[db] Recovered ${n} unfinished send claim(s); see Team Activity`)).catch(() => {});
+  setTimeout(sweep, 5000).unref();
+  setInterval(sweep, 60 * 1000).unref();
 } else {
   console.log('[storage] Using local files (MONGODB_URI is not set)');
 }

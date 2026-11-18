@@ -82,12 +82,17 @@ export function makeMailer(fake, config = testConfig()) {
 }
 
 /** Start the app on a random port and return a small client with a cookie jar. */
-export async function startTestServer({ dataDir, mailer, config = testConfig(), storage, headers: defaultHeaders = {} }) {
+export async function startTestServer({ dataDir, mailer, config = testConfig(), storage, headers = {} }) {
   const app = createApp({ config, dataDir, mailer, ...(storage ? { storage } : {}) });
   const server = await new Promise((resolve) => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
   });
-  const base = `http://127.0.0.1:${server.address().port}`;
+  const client = makeClient(`http://127.0.0.1:${server.address().port}`, headers);
+  return { ...client, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+/** HTTP client with a cookie jar for a server at `base` (in this process or another one). */
+export function makeClient(base, defaultHeaders = {}) {
   let cookie = '';
 
   /**
@@ -134,10 +139,5 @@ export async function startTestServer({ dataDir, mailer, config = testConfig(), 
     return request('POST', '/api/excel/upload', { form });
   }
 
-  return {
-    base,
-    request,
-    upload,
-    close: () => new Promise((resolve) => server.close(resolve)),
-  };
+  return { base, request, upload };
 }

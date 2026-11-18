@@ -432,6 +432,8 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       features: storage.features,
       teamMembers,
       operatorIdentification: 'self-declared',
+      // Which shared database is in use (its name only; never the connection string).
+      database: storage.kind === 'mongodb' ? storage.db?.databaseName ?? null : null,
       historyLabel: historyFileLabel,
     });
   });
@@ -578,11 +580,15 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     if (req.body?.expected !== undefined) assertSelection(req.body.expected, wb, mappingVersion, values);
     const identity = recordIdentity(values);
     const { exact, possible } = matchHistory(await history.entriesInOrder(), identity, values);
+    const uncertain = storage.features.blocksUncertain ? unresolvedUncertain([...exact, ...possible]) : [];
     ok(res, {
       recordId: identity.recordId,
       idType: identity.idType,
       reliable: identity.reliable,
       attorneyName: values.get('attorneyName'),
+      // An unresolved "Uncertain" send blocks sending until it is reconciled.
+      uncertainUnresolved: uncertain.length > 0,
+      uncertain: [...uncertain].reverse(),
       alreadySent: exact.length > 0,
       possibleDuplicate: exact.length === 0 && possible.length > 0,
       previous: exact.reverse(),
@@ -625,21 +631,27 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     const sendMethod = mailer.publicInfo().provider === 'resend' ? 'Resend' : 'SMTP';
     const draft = (status, sendType) => historyEntry({ identity, values, subject, senderEmail, status, sendType, sendMethod, operator, requestId, workbookId: wb.version });
     // Claim this attorney (and, with MongoDB, this address) for this send. With
-    // MongoDB the claim is shared by every server process; if the server stops
-    // mid-send, the claim is later recorded as "Uncertain".
+    // MongoDB the claim is durable and shared by every server process. It is
+    // removed only once the outcome is in the history; if the server stops or the
+    // database fails, recovery records the outcome later (see storage/mongo.js).
     const claim = await storage.locks.acquire({ recordKey: recordId, emailKey: to, requestId, kind: 'send', entry: draft('Uncertain', '') });
     sendRequests.set(requestId, { status: 'pending', at: Date.now() });
-    let sendType = 'First Send';
-    let attempted = false;
     // Wait for any other team member's send to finish, so duplicate checks always
     // see the latest history.
     await sendMutex.run(async () => {
+    let sendType = 'First Send';
+    let handedToProvider = false;
+    let sent;
     try {
       // Re-check after waiting for other team members' sends: the workbook or
       // mapping may have been replaced in the meantime.
       if (workbook !== wb || (persistent && (await liveWorkbookVersion()) !== wb.version)) throw stale('workbook');
       if (mappingVersionOf(resolveMapping(await loadSavedMapping(), wb.headers)) !== mappingVersion) throw stale('mapping');
       const { exact, possible } = matchHistory(await history.entriesInOrder(), identity, values);
+      // An "Uncertain" send is never repeated, not even with "Send again": its
+      // outcome must first be reconciled (Sent History -> Correct).
+      const uncertain = storage.features.blocksUncertain ? unresolvedUncertain([...exact, ...possible]) : [];
+      if (uncertain.length) throw uncertainError(uncertain, recordId, identity.idType);
       if (exact.length && confirmResend !== true) {
         throw new AppError(409, 'ALREADY_SENT', 'This attorney has already received an email.', { previous: exact.reverse(), recordId, idType: identity.idType });
       }
@@ -653,60 +665,97 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
       }
       sendType = exact.length ? 'Resend' : 'First Send';
 
-      attempted = true;
+      // Durably record "sending" BEFORE the provider is called. If this can't be
+      // written, nothing is sent (the error below says so).
+      await claim.begin({ sendType });
+      handedToProvider = true;
       // The send request ID doubles as the provider's idempotency key (Resend), so a
       // retried request can never produce a second email there.
-      const sent = await mailer.send({ to, subject, body, idempotencyKey: `zp-send-${requestId}` });
-      if (lastSmtpTest && !lastSmtpTest.ok && lastSmtpTest.code === 'SMTP_AUTH_FAILED') lastSmtpTest = null;
-
-      const entry = { ...draft('Success', sendType), messageId: sent.messageId || null };
-      console.log(`[send] Email accepted by the ${sendMethod} service (${entry.sendType}, row ${row.rowNumber})`);
-      const saved = await history.append(entry);
-      const activityId = await storage.activity.record({
-        action: 'email_sent',
-        summary: `Sent an email via ${sendMethod} (${sendType})`,
-        ctx,
-        attorney: entry,
-        historyId: saved.id,
-        details: { sendMethod, sendType, messageId: sent.messageId || null, subject: entry.subject },
-      });
-      if (saved.id && activityId) await storage.activity.link?.(activityId, saved.id);
-      const response = {
-        accepted: true,
-        message: `${providerLabel(mailer.publicInfo().provider)} accepted the email for delivery to ${to}.`,
-        messageId: sent.messageId,
-        entry,
-        historySaved: saved.saved,
-        historyWarning: saved.saved ? null : saved.warning,
-      };
-      sendRequests.set(requestId, { status: 'done', response, at: Date.now() });
-      ok(res, response);
+      sent = await mailer.send({ to, subject, body, idempotencyKey: `zp-send-${requestId}` });
     } catch (err) {
       sendRequests.delete(requestId); // allow a retry after a failure
       if (err?.code === 'SMTP_AUTH_FAILED') lastSmtpTest = { ok: false, at: formatDateTime(), code: err.code, message: err.message };
-      if (attempted) {
-        // Record the failed attempt. It is never marked as a success and, unless
-        // the outcome is uncertain, does not count as "already sent".
-        const status = err?.code === 'SMTP_UNCERTAIN' ? 'Uncertain' : 'Failed';
-        const failed = draft(status, sendType);
-        const saved = await history.append(failed);
-        if (!saved.saved) console.error('[history] Could not record the failed send attempt');
-        await storage.activity.record({
-          action: status === 'Uncertain' ? 'email_uncertain' : 'email_failed',
-          summary: `${status === 'Uncertain' ? 'Send outcome uncertain' : 'Send failed'} via ${sendMethod}`,
-          outcome: status.toLowerCase(),
-          ctx,
-          attorney: failed,
-          historyId: saved.id,
-          details: { sendMethod, sendType, errorCode: err?.code || null },
-        });
+      if (!handedToProvider) {
+        await claim.release(); // the provider was never called: nothing to record
+        throw err;
       }
+      // The provider refused the email, or its answer is unknown. Only a definite
+      // refusal is "Failed"; anything else is "Uncertain" (never marked as sent).
+      const status = err instanceof AppError && err.code !== 'SMTP_UNCERTAIN' ? 'Failed' : 'Uncertain';
+      await claim.finish(status === 'Failed' ? 'failed' : 'uncertain');
+      const failed = { ...draft(status, sendType), claimId: claim.id, providerConfirmed: status === 'Failed' };
+      const saved = await history.append(failed);
+      // Keep the claim when the outcome could not be recorded: it keeps blocking
+      // this attorney until recovery writes the outcome.
+      if (saved.saved || !claim.durable) await claim.release();
+      else console.error('[history] Could not record the failed send attempt; the send claim is kept until it is recorded');
+      await storage.activity.record({
+        action: status === 'Uncertain' ? 'email_uncertain' : 'email_failed',
+        summary: `${status === 'Uncertain' ? 'Send outcome uncertain' : 'Send failed'} via ${sendMethod}`,
+        outcome: status.toLowerCase(),
+        ctx,
+        attorney: failed,
+        historyId: saved.id,
+        details: { sendMethod, sendType, errorCode: err?.code || null },
+      });
       throw err;
-    } finally {
-      await claim.release();
     }
+
+    // The provider confirmed acceptance.
+    if (lastSmtpTest && !lastSmtpTest.ok && lastSmtpTest.code === 'SMTP_AUTH_FAILED') lastSmtpTest = null;
+    await claim.finish('accepted', { messageId: sent.messageId || null });
+    const { providerConfirmed, ...entry } = { ...draft('Success', sendType), messageId: sent.messageId || null, claimId: claim.id, providerConfirmed: true };
+    console.log(`[send] Email accepted by the ${sendMethod} service (${entry.sendType}, row ${row.rowNumber})`);
+    let saved = await history.append({ ...entry, providerConfirmed });
+    // MongoDB: read the record back, so "saved" means it is really in email_history.
+    if (saved.saved && history.get) {
+      const stored = saved.id ? await history.get(saved.id).catch(() => null) : null;
+      const verified = Boolean(stored && stored.status === 'Success' && stored.claimId === entry.claimId && stored.recipientEmail === entry.recipientEmail);
+      if (verified) {
+        console.log(`[send] Recorded in ${storage.historyLabel} (record ${saved.id})`);
+      } else {
+        console.error('[send] The history record could not be read back after the send; the send claim is kept until recovery records it');
+        saved = { saved: false, keptPending: true, warning: 'The email was accepted, but its record could not be confirmed in the shared database yet. This attorney stays blocked for everyone, and the record is added automatically.' };
+      }
+    }
+    // Only release once the Success is in the history. Otherwise the claim (now
+    // "accepted", with the provider's message id) keeps blocking every user and
+    // process until recovery records it.
+    if (saved.saved || !claim.durable) await claim.release();
+    const activityId = await storage.activity.record({
+      action: 'email_sent',
+      summary: `Sent an email via ${sendMethod} (${sendType})`,
+      ctx,
+      attorney: entry,
+      historyId: saved.id,
+      details: { sendMethod, sendType, messageId: sent.messageId || null, subject: entry.subject },
+    });
+    if (saved.id && activityId) await storage.activity.link?.(activityId, saved.id);
+    const response = {
+      accepted: true,
+      message: `${providerLabel(mailer.publicInfo().provider)} accepted the email for delivery to ${to}.`,
+      messageId: sent.messageId,
+      entry: { ...entry, id: saved.id || null },
+      historySaved: saved.saved,
+      historyId: saved.id || null,
+      historyStore: storage.kind,
+      historyWarning: saved.saved ? null : saved.warning,
+    };
+    sendRequests.set(requestId, { status: 'done', response, at: Date.now() });
+    ok(res, response);
     });
   });
+
+  /** Unresolved "Uncertain" sends among history matches (they are never resent automatically). */
+  const unresolvedUncertain = (list) => list.filter((e) => e.status === 'Uncertain' && !e.voided);
+  const uncertainError = (list, recordId, idType) =>
+    new AppError(
+      409,
+      'UNCERTAIN_UNRESOLVED',
+      'An earlier email to this attorney (or this address) has an unknown outcome ("Uncertain"), so it is not sent again, not even with "Send again". ' +
+        'Check the email provider (the Resend dashboard, or the Sent folder in Hostinger Webmail), then record the result in Sent History ("Correct…": it was sent / it was not sent). After that you can send if needed.',
+      { uncertain: [...list].reverse(), recordId, idType },
+    );
 
   function historyEntry({ identity, values, subject, senderEmail, status, sendType, sendMethod = '', operator = null, requestId = null, workbookId = null, note = '' }) {
     const now = new Date();
@@ -854,7 +903,8 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
         if (possible.length && confirmPossible !== true) {
           throw new AppError(409, 'POSSIBLE_DUPLICATE', 'An email to this address is already in the history under a different record.', { possible: possible.reverse() });
         }
-        const saved = await history.append(entry);
+        // No local fallback here: a mark that could not be saved must not reappear later.
+        const saved = await history.append(entry, { fallback: false });
         if (!saved.saved) throw new AppError(503, 'DB_UNAVAILABLE', 'The shared database could not be updated. The attorney was not marked as sent; please try again.');
         const activityId = await storage.activity.record({ action: 'manual_mark_sent', summary: 'Marked as sent manually (contacted outside the app)', ctx, attorney: entry, historyId: saved.id, details: { note: noteText } });
         if (saved.id && activityId) await storage.activity.link?.(activityId, saved.id);
@@ -873,7 +923,12 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     const reason = typeof req.body?.reason === 'string' ? req.body.reason.replace(/\s+/g, ' ').trim().slice(0, 500) : '';
     if (reason.length < 3) throw new AppError(400, 'REASON_REQUIRED', 'Please give a short reason for the correction (it is kept in the activity log).');
     const result = await sendMutex.run(() => history.correct(req.params.id, { action, reason, operator }));
-    const labels = { void: 'Voided a history record', 'confirm-sent': 'Confirmed an uncertain send as sent', 'confirm-not-sent': 'Confirmed an uncertain send as not sent' };
+    const labels = {
+      void: 'Voided a history record',
+      'confirm-sent': 'Confirmed an uncertain send as sent',
+      'confirm-not-sent': 'Confirmed an uncertain send as not sent',
+      undo: result.before.voided ? 'Undid a void (the record counts again)' : 'Undid a confirmation (the send is Uncertain again)',
+    };
     await storage.activity.record({
       action: 'history_corrected',
       summary: labels[action] || 'Corrected a history record',

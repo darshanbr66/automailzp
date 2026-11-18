@@ -4,7 +4,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { BSON } from 'mongodb';
+import { backupCollections } from './dbops.js';
 import { HistoryStore } from './history.js';
 import { validateTemplate } from './template.js';
 import { sanitizeMapping } from './excel.js';
@@ -151,62 +151,134 @@ export async function readLegacySources({ dataDir, historyJsonPath = null, legac
 }
 
 // ---- Backup ----------------------------------------------------------------------------------
-/** Copy the legacy files and export every MongoDB collection to `outDir`. */
-export async function backup({ dataDir, db = null, outDir, historyJsonPath = null }) {
+/**
+ * Copy the legacy files and export every MongoDB collection to `outDir`
+ * (with a checksummed manifest; see dbops.js). Never changes the sources.
+ */
+export async function backup({ dataDir, db = null, outDir, historyJsonPath = null, target = null }) {
   await fs.mkdir(outDir, { recursive: true });
   const files = [];
   for (const name of ['sent-emails.xlsx', 'sent-emails-pending.json', 'template.json', 'settings.json', 'mongo-history-fallback.json']) {
     const buf = await readFileIfExists(path.join(dataDir, name)).catch(() => null);
     if (buf) {
-      await fs.writeFile(path.join(outDir, name), buf);
+      await fs.writeFile(path.join(outDir, name), buf, { mode: 0o600 });
       files.push(name);
     }
   }
   if (historyJsonPath) {
     const buf = await readFileIfExists(historyJsonPath).catch(() => null);
     if (buf) {
-      await fs.writeFile(path.join(outDir, `history-export-${path.basename(historyJsonPath)}`), buf);
+      await fs.writeFile(path.join(outDir, `history-export-${path.basename(historyJsonPath)}`), buf, { mode: 0o600 });
       files.push(path.basename(historyJsonPath));
     }
   }
+  let manifest = null;
   const collections = {};
   if (db) {
-    for (const name of Object.values(COLLECTIONS)) {
-      const docs = await db.collection(name).find({}).toArray();
-      await fs.writeFile(path.join(outDir, `mongodb-${name}.json`), BSON.EJSON.stringify(docs, { relaxed: false }, 2));
-      collections[name] = docs.length;
-    }
+    manifest = await backupCollections({ db, outDir, target });
+    for (const [name, info] of Object.entries(manifest.collections)) collections[name] = info.count;
   }
   await fs.writeFile(path.join(outDir, 'backup-info.json'), JSON.stringify({ createdAtUtc: new Date().toISOString(), dataDir, files, collections }, null, 2));
-  return { outDir, files, collections };
+  return { outDir, files, collections, manifest };
 }
 
 // ---- Migration ---------------------------------------------------------------------------------
+const KNOWN_STATUSES = ['Success', 'Failed', 'Uncertain'];
+const EARLIEST_PLAUSIBLE = Date.UTC(2015, 0, 1);
+const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/** History counts in the database (for the before/after comparison). */
+export async function historyCounts(db) {
+  const hist = db.collection(COLLECTIONS.history);
+  const byStatus = Object.fromEntries((await hist.aggregate([{ $group: { _id: '$status', n: { $sum: 1 } } }]).toArray()).map((g) => [String(g._id), g.n]));
+  return { total: await hist.countDocuments({}), byStatus, migrated: await hist.countDocuments({ source: 'migration' }) };
+}
+
+/** The UTC instant of a legacy row: its recorded UTC time when valid, else its local text. */
+function utcOf(entry, timeZone) {
+  if (entry.sentAtUtc && ISO_UTC_RE.test(String(entry.sentAtUtc))) {
+    const d = new Date(entry.sentAtUtc);
+    if (!Number.isNaN(d.valueOf())) return { utc: d, recorded: true };
+  }
+  return { utc: legacyLocalToUtc(entry.sentAt, timeZone), recorded: false };
+}
+
+/**
+ * Check the legacy rows before importing: dates, statuses, pending and
+ * uncertain rows, and fingerprints. Never writes.
+ */
+export function preflight(src, { now = Date.now() } = {}) {
+  const dates = { recordedUtc: 0, convertedFromLocal: 0, unparsable: [], invalidUtc: [], suspicious: [] };
+  const statuses = {};
+  let pendingRows = 0;
+  const fingerprints = { candidates: src.items.length, repeatedIdenticalRows: 0, inBothSources: src.duplicatesAcrossSources || 0 };
+  src.items.forEach(({ entry, source, timeZone }, i) => {
+    const where = { index: i + 1, source, recordId: entry.recordId || '', sentAt: entry.sentAt || '', sentAtUtc: entry.sentAtUtc || '' };
+    const s = entry.status || '(empty)';
+    statuses[s] = (statuses[s] || 0) + 1;
+    if (entry.pendingSave || source === 'pending-file') pendingRows += 1;
+    if (!String(entry.legacyKey).endsWith(':0')) fingerprints.repeatedIdenticalRows += 1;
+    if (entry.sentAtUtc && !ISO_UTC_RE.test(String(entry.sentAtUtc))) dates.invalidUtc.push(where);
+    const { utc, recorded } = utcOf(entry, timeZone);
+    if (!utc) dates.unparsable.push(where);
+    else {
+      if (recorded) dates.recordedUtc += 1;
+      else dates.convertedFromLocal += 1;
+      if (utc.valueOf() > now + 86400000 || utc.valueOf() < EARLIEST_PLAUSIBLE) dates.suspicious.push({ ...where, utc: utc.toISOString() });
+    }
+  });
+  const unknownStatuses = Object.keys(statuses).filter((s) => !KNOWN_STATUSES.includes(s));
+  return { dates, statuses, unknownStatuses, pendingRows, uncertainRows: statuses.Uncertain || 0, fingerprints };
+}
+
 /**
  * Import legacy data into MongoDB. Idempotent: history rows are upserted by
  * fingerprint; the template/mapping are only imported when the database has none
- * (unless forced). With dryRun nothing is written.
+ * (unless forced). With dryRun nothing is written. Every imported row carries
+ * the run id, so one run can be rolled back exactly (rollbackMigration).
+ *
+ * Refuses to write when a row's date can't be read (unless allowUnparsableDates)
+ * and verifies afterwards that every legacy row is present.
  */
-export async function migrate({ db, dataDir, historyJsonPath = null, legacyTimeZone, historyJsonTimeZone = 'UTC', dryRun = true, forceTemplate = false, forceMapping = false }) {
+export async function migrate({ db, dataDir, historyJsonPath = null, legacyTimeZone, historyJsonTimeZone = 'UTC', dryRun = true, forceTemplate = false, forceMapping = false, allowUnparsableDates = false, runId = null }) {
   const src = await readLegacySources({ dataDir, historyJsonPath, legacyTimeZone, historyJsonTimeZone });
-  const report = { dryRun, found: src.found, problems: [...src.problems], history: { candidates: src.items.length, inserted: 0, alreadyPresent: 0, unparsableDates: 0 }, template: 'not found', mapping: 'not found' };
+  const id = runId || `mig-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${crypto.randomBytes(3).toString('hex')}`;
+  const checks = preflight(src);
+  const report = {
+    dryRun,
+    runId: dryRun ? null : id,
+    found: src.found,
+    problems: [...src.problems],
+    preflight: checks,
+    history: { candidates: src.items.length, inserted: 0, alreadyPresent: 0, unparsableDates: checks.dates.unparsable.length },
+    counts: { before: await historyCounts(db), after: null },
+    verification: null,
+    template: 'not found',
+    mapping: 'not found',
+  };
+  if (checks.unknownStatuses.length) report.problems.push(`Rows with unexpected status values are imported unchanged: ${checks.unknownStatuses.join(', ')}.`);
+  if (checks.dates.unparsable.length && !allowUnparsableDates) {
+    report.blocked = `${checks.dates.unparsable.length} row(s) have a date that can't be read (see preflight.dates.unparsable). Fix them in the source, or re-run with --allow-unparsable-dates to import them dated 1970-01-01.`;
+    if (!dryRun) return report;
+  }
   if (!dryRun) await ensureIndexes(db);
   const hist = db.collection(COLLECTIONS.history);
 
-  const existing = new Set((await hist.find({ legacyKey: { $in: src.items.map((i) => i.entry.legacyKey) } }, { projection: { legacyKey: 1 } }).toArray()).map((d) => d.legacyKey));
+  const keys = src.items.map((i) => i.entry.legacyKey);
+  const existing = new Set((await hist.find({ legacyKey: { $in: keys } }, { projection: { legacyKey: 1 } }).toArray()).map((d) => d.legacyKey));
   const ops = [];
   for (const { entry, source, timeZone } of src.items) {
     if (existing.has(entry.legacyKey)) {
       report.history.alreadyPresent += 1;
       continue;
     }
-    const utc = entry.sentAtUtc ? new Date(entry.sentAtUtc) : legacyLocalToUtc(entry.sentAt, timeZone);
-    if (!utc || Number.isNaN(utc.valueOf())) report.history.unparsableDates += 1;
+    const { utc, recorded } = utcOf(entry, timeZone);
+    const { pendingSave, ...rest } = entry;
     const doc = toHistoryDoc({
-      ...entry,
-      sentAtUtc: utc && !Number.isNaN(utc.valueOf()) ? utc.toISOString() : new Date(0).toISOString(),
+      ...rest,
+      sentAtUtc: utc ? utc.toISOString() : new Date(0).toISOString(),
       source: 'migration',
-      legacy: { source, sentAtText: entry.sentAt || '', timeZoneAssumed: entry.sentAtUtc ? 'recorded in UTC' : timeZone, pendingSave: Boolean(entry.pendingSave) },
+      legacy: { source, sentAtText: entry.sentAt || '', timeZoneAssumed: recorded ? 'recorded in UTC' : timeZone, pendingSave: Boolean(pendingSave), unparsableDate: !utc, migrationRunId: id },
       legacyKey: entry.legacyKey,
     });
     ops.push({ updateOne: { filter: { legacyKey: entry.legacyKey }, update: { $setOnInsert: doc }, upsert: true } });
@@ -214,11 +286,12 @@ export async function migrate({ db, dataDir, historyJsonPath = null, legacyTimeZ
   if (dryRun) {
     report.history.inserted = ops.length;
   } else if (ops.length) {
-    const r = await hist.bulkWrite(ops, { ordered: false });
+    const r = await hist.bulkWrite(ops, { ordered: false, writeConcern: { w: 'majority' } });
     report.history.inserted = r.upsertedCount;
     report.history.alreadyPresent += ops.length - r.upsertedCount;
   }
 
+  const previous = {};
   for (const [kind, value, force, colName] of [['template', src.template, forceTemplate, COLLECTIONS.templates], ['mapping', src.mapping, forceMapping, COLLECTIONS.mappings]]) {
     if (!value) continue;
     const current = await db.collection(colName).findOne({ _id: 'active' });
@@ -227,17 +300,72 @@ export async function migrate({ db, dataDir, historyJsonPath = null, legacyTimeZ
       continue;
     }
     report[kind] = dryRun ? 'would be imported' : 'imported';
-    if (!dryRun) await db.collection(colName).updateOne({ _id: 'active' }, { $set: { [kind]: value, updatedAt: new Date(), updatedBy: 'migration' } }, { upsert: true });
+    previous[kind] = current ? current[kind] : null;
+    if (!dryRun) await db.collection(colName).updateOne({ _id: 'active' }, { $set: { [kind]: value, updatedAt: new Date(), updatedBy: 'migration', migrationRunId: id } }, { upsert: true });
   }
 
   if (!dryRun) {
+    // Verify: every legacy row is present, and the totals add up.
+    const after = await historyCounts(db);
+    report.counts.after = after;
+    const present = await hist.countDocuments({ legacyKey: { $in: keys } });
+    const expectedTotal = report.counts.before.total + report.history.inserted;
+    const missing = keys.length - present;
+    report.verification = { ok: missing === 0 && after.total >= expectedTotal, legacyRowsPresent: present, legacyRowsExpected: keys.length, missing, expectedTotalAtLeast: expectedTotal, total: after.total };
+    if (after.total > expectedTotal) report.verification.note = `${after.total - expectedTotal} record(s) were added by the app while the migration ran.`;
+    if (!report.verification.ok) report.problems.push(`Verification failed: ${missing} legacy row(s) are missing after the import. Do not switch over; see the rollback procedure.`);
     await db.collection(COLLECTIONS.activity).insertOne({
       at: new Date(),
       action: 'data_migrated',
-      summary: `Imported legacy data: ${report.history.inserted} history row(s)`,
-      outcome: 'ok',
+      summary: `Imported legacy data: ${report.history.inserted} history row(s) (run ${id})`,
+      outcome: report.verification.ok ? 'ok' : 'failed',
       operator: { name: 'migration script', idType: 'system' },
-      details: { found: report.found, history: report.history, template: report.template, mapping: report.mapping, problems: report.problems, legacyTimeZone, historyJsonTimeZone },
+      details: { runId: id, found: report.found, history: report.history, counts: report.counts, verification: report.verification, template: report.template, mapping: report.mapping, previous, problems: report.problems, legacyTimeZone, historyJsonTimeZone },
+    });
+  }
+  return report;
+}
+
+/**
+ * Undo one migration run: removes ONLY the history rows that run inserted and
+ * that nobody has corrected since, and puts back the template/mapping it
+ * replaced (if unchanged since). Corrected rows are listed and kept.
+ * With dryRun nothing is written.
+ */
+export async function rollbackMigration({ db, runId, dryRun = true }) {
+  if (!/^mig-[A-Za-z0-9-]{6,60}$/.test(String(runId || ''))) throw new Error('A valid migration run id (mig-...) is required; it is printed by the migration and kept in Team Activity.');
+  const hist = db.collection(COLLECTIONS.history);
+  const run = await db.collection(COLLECTIONS.activity).findOne({ action: 'data_migrated', 'details.runId': runId });
+  const filter = { source: 'migration', 'legacy.migrationRunId': runId };
+  const all = await hist.find(filter, { projection: { _id: 1, void: 1, resolution: 1, corrections: 1, recordId: 1, status: 1 } }).toArray();
+  const isCorrected = (d) => Boolean(d.void || d.resolution || (Array.isArray(d.corrections) && d.corrections.length));
+  const corrected = all.filter(isCorrected);
+  const removable = all.filter((d) => !isCorrected(d)).map((d) => d._id);
+  const report = { dryRun, runId, runFound: Boolean(run), rows: all.length, removable: removable.length, keptBecauseCorrected: corrected.map((d) => ({ id: String(d._id), recordId: d.recordId, status: d.status })), restored: [], deleted: 0 };
+  for (const [kind, colName] of [['template', COLLECTIONS.templates], ['mapping', COLLECTIONS.mappings]]) {
+    if (!run?.details?.previous || !(kind in run.details.previous)) continue;
+    const current = await db.collection(colName).findOne({ _id: 'active' });
+    if (current?.migrationRunId !== runId) {
+      report.restored.push(`${kind}: changed since the migration, left as it is`);
+      continue;
+    }
+    const prev = run.details.previous[kind];
+    report.restored.push(`${kind}: ${prev ? 'previous one put back' : 'removed (there was none before)'}`);
+    if (dryRun) continue;
+    if (prev) await db.collection(colName).updateOne({ _id: 'active', migrationRunId: runId }, { $set: { [kind]: prev, updatedAt: new Date(), updatedBy: 'migration rollback' }, $unset: { migrationRunId: '' } });
+    else await db.collection(colName).deleteOne({ _id: 'active', migrationRunId: runId });
+  }
+  if (!dryRun) {
+    if (removable.length) {
+      report.deleted = (await hist.deleteMany({ _id: { $in: removable }, ...filter, void: { $exists: false }, resolution: { $exists: false }, 'corrections.0': { $exists: false } })).deletedCount;
+    }
+    await db.collection(COLLECTIONS.activity).insertOne({
+      at: new Date(),
+      action: 'migration_rolled_back',
+      summary: `Rolled back migration ${runId}: removed ${report.deleted} imported history row(s)`,
+      outcome: corrected.length ? 'partial' : 'ok',
+      operator: { name: 'migration script', idType: 'system' },
+      details: report,
     });
   }
   return report;

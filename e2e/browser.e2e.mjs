@@ -83,7 +83,7 @@ const express = (await importBackendDep('express')).default;
 const { MongoMemoryServer } = await importBackendDep('mongodb-memory-server');
 const { createApp } = await importRepo('backend/src/app.js');
 const { createMongoStorage } = await importRepo('backend/src/storage/mongo.js');
-const { fakeTransport, makeMailer, makeWorkbookBuffer, testConfig } = await importRepo('backend/test/helpers.js');
+const { fakeTransport, makeMailer, makeWorkbookBuffer, smtpError, testConfig } = await importRepo('backend/test/helpers.js');
 
 // ---- Test environment ---------------------------------------------------------------
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'zp-e2e-'));
@@ -336,6 +336,48 @@ async function teamWorkflow(base, smtp) {
   await bob.close();
 }
 
+/** An Uncertain send is never repeated from the page until a team member reconciles it. */
+async function uncertainReconciliation(base, smtp) {
+  out('\n# Uncertain send: blocked until reconciled');
+  const u = await openUser(base);
+  await u.open();
+  await u.chooseOperator('Vikram');
+  const pick = async () => {
+    await u.tab('Compose Email');
+    // The shared workbook list loads asynchronously in a fresh browser session.
+    await u.waitFor(`[...document.querySelectorAll('${VISIBLE} .records-table-wrap tbody tr')].some(tr => tr.textContent.includes('Attorney C'))`, 15000);
+    await u.js(`[...document.querySelectorAll('${VISIBLE} .records-table-wrap tbody tr')].find(tr => tr.textContent.includes('Attorney C')).click(); return true`);
+    await u.waitFor(`document.querySelector('.email-card textarea')?.value.includes('Attorney C')`);
+  };
+  const before = smtp.state.sent.length;
+  smtp.state.sendQueue.push({ error: smtpError('ETIMEDOUT', { command: 'DATA', message: 'Timeout' }) });
+  await pick();
+  await u.click('.email-card .btn-primary', 'Send Email');
+  check('U1. a dropped connection is reported as possibly sent', await u.waitFor(`document.querySelector('.email-card .alert')?.textContent.includes('may or may not have been sent')`));
+  await u.click('.email-card .btn-primary', 'Send Email');
+  const dialog = await u.waitFor(`document.querySelector('.modal h3')?.textContent.includes('unknown outcome')`);
+  check('U2. sending again shows the "unknown outcome" dialog with steps to check', dialog && (await u.js(`return document.querySelector('.modal').textContent.includes('Resend dashboard')`)));
+  check('U3. that dialog offers no way to send', await u.js(`return ![...document.querySelectorAll('.modal button')].some(b => /send/i.test(b.textContent))`));
+  await u.click('.modal button', 'Close');
+
+  await u.tab('Sent History');
+  await u.click(`${VISIBLE} .segmented button`, 'All send attempts');
+  await u.waitFor(`[...document.querySelectorAll('${VISIBLE} tr')].some(tr => tr.textContent.includes('Attorney C') && tr.querySelector('button'))`);
+  await u.js(`[...document.querySelectorAll('${VISIBLE} tr')].find(tr => tr.textContent.includes('Attorney C') && tr.querySelector('button')).querySelector('button').click(); return true`);
+  await u.waitFor(`document.querySelector('.modal h3')?.textContent.includes('Correct')`);
+  const choices = await u.js(`return [...document.querySelectorAll('.modal .operator-choice')].map(l => l.textContent)`);
+  check('U4. an Uncertain record offers "sent" / "not sent", not "void"', choices.length === 2 && choices.some((c) => c.includes('not sent')) && !choices.some((c) => c.includes('Void')), choices);
+  await u.typeInto('.modal input[type=text]', 'Not in the provider log');
+  await u.click('.modal button', 'Save correction');
+  check('U5. reconciled: shown as confirmed by the operator, with Undo offered', await u.waitFor(`[...document.querySelectorAll('${VISIBLE} tr')].some(tr => tr.textContent.includes('Attorney C') && tr.textContent.includes('confirmed “Not sent” by Vikram') && tr.textContent.includes('Correct / undo'))`));
+
+  await pick();
+  await u.click('.email-card .btn-primary', 'Send Email');
+  check('U6. after "not sent" the attorney can be emailed', await u.waitFor(`document.querySelector('.toast')?.textContent.includes('Attorney C copied')`));
+  check('U7. exactly one more email reached the provider', smtp.state.sent.length === before + 1, smtp.state.sent.map((m) => m.to));
+  await u.close();
+}
+
 /** The operator prompt must come back whenever the server would refuse actions. */
 async function operatorPromptResilience(base) {
   out('\n# Operator prompt resilience');
@@ -426,7 +468,7 @@ try {
   console.error = () => {};
   const { base, smtp } = await startServer();
   await startChrome();
-  for (const scenario of [teamWorkflow, operatorPromptResilience]) {
+  for (const scenario of [teamWorkflow, uncertainReconciliation, operatorPromptResilience]) {
     try {
       await scenario(base, smtp);
     } catch (err) {

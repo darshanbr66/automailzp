@@ -268,6 +268,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--p
 
 /* ---- Sign-in ------------------------------------------------------------------ */
 .topbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+/* Which storage this server uses, so the MongoDB and file versions can't be confused. */
+.storage-badge { font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+.storage-db { color: #14532d; background: #dcfce7; border-color: #86efac; }
+.storage-file { color: #7c2d12; background: #ffedd5; border-color: #fdba74; }
 .session-info { display: flex; align-items: center; gap: 8px; padding-left: 14px; border-left: 1px solid var(--border); }
 .auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg); }
 .auth-card { width: 100%; max-width: 360px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(17, 24, 39, 0.08); padding: 22px 22px 18px; }

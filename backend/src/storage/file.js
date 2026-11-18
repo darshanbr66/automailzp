@@ -16,7 +16,7 @@ export function createFileStorage(dataDir) {
 
   return {
     kind: 'file',
-    features: { persistentWorkbook: false, manualMarking: false, corrections: false, activity: false, operatorRequired: false },
+    features: { persistentWorkbook: false, manualMarking: false, corrections: false, activity: false, operatorRequired: false, blocksUncertain: false },
     historyLabel: 'backend/data/sent-emails.xlsx',
 
     history: {
@@ -60,7 +60,8 @@ export function createFileStorage(dataDir) {
         const key = normalizeId(recordKey);
         if (sending.has(key)) throw new AppError(409, 'SEND_IN_PROGRESS', 'An email to this attorney is already being sent. Please wait.');
         sending.add(key);
-        return { release: async () => sending.delete(key) };
+        // Same interface as the MongoDB claim; within one process the lock is all that is needed.
+        return { id: null, durable: false, begin: async () => {}, finish: async () => true, release: async () => sending.delete(key) };
       },
       sweep: async () => 0,
     },

@@ -6,7 +6,8 @@ This guide moves the app from a single Windows PC to a hosted setup the whole te
 |---|---|---|
 | Frontend (React, static files) | **Vercel** | `https://app.zodiacpatent.com` |
 | Backend API (Node/Express) | **Render**, Free Web Service | `https://api.zodiacpatent.com` |
-| History, templates, mapping, sessions | **Temporary** app folder on Render (no disk) | `backend/data` inside the service |
+| History, workbook, template, mapping, team activity | **MongoDB Atlas M0 Free** (permanent, shared) | database `automail` |
+| Sign-in sessions only | Temporary app folder on Render (no disk) | `backend/data` inside the service |
 | Outgoing email | **Resend HTTPS API** (free plan) | `api.resend.com`, sender `vikram@zodiacpatent.com` |
 | Access | One **shared team login** | — |
 
@@ -14,36 +15,30 @@ This guide moves the app from a single Windows PC to a hosted setup the whole te
 Browser ──HTTPS──▶ app.zodiacpatent.com (Vercel: static files only, no secrets)
    │
    └──HTTPS + session cookie──▶ api.zodiacpatent.com (Render Free, 1 instance)
-                                   ├── backend/data  (TEMPORARY: wiped on restart)
-                                   └── smtp.hostinger.com:465 (App Password)
+                                   ├── MongoDB Atlas "automail" (permanent, shared)
+                                   ├── backend/data  (sessions only; wiped on restart)
+                                   └── api.resend.com (HTTPS)
 ```
 
-**Where secrets live:** the Resend API key, the login password hash and the session secret exist **only** as Render environment variables. Vercel only knows the public API address. The browser only ever holds an HttpOnly session cookie that JavaScript can't read.
+**Where secrets live:** the MongoDB connection string, the Resend API key, the login password hash and the session secret exist **only** as Render environment variables. Vercel only knows the public API address. The browser only ever holds an HttpOnly session cookie that JavaScript can't read.
 
 ---
 
-## Render Free: what is not kept
+## Render Free with MongoDB: what is kept
 
-This setup uses **Render Free without a persistent disk**. The backend stores its files in its own app folder (`backend/data`), which Render **wipes whenever the service restarts, redeploys, or wakes up after sleeping**. Free services go to sleep after about 15 minutes without traffic, so expect this to happen often, typically several times a day.
+All shared data lives in **MongoDB Atlas** (free M0 cluster, database `automail`), so restarts, sleep and redeploys don't lose anything except sign-in sessions.
 
 | Data | Kept after a restart, sleep or redeploy? |
 |---|---|
-| **Sending history** (`sent-emails.xlsx`, pending rows) | **No, lost** |
-| **Email template** you saved (`template.json`) | **No.** It goes back to the default ZodiacPatent template. |
-| **Column mapping** (`settings.json`) | **No.** Columns are guessed again from the headings. |
-| **Sign-in sessions** (`sessions/`) | **No.** Everyone has to sign in again. |
-| **Uploaded attorney workbook** | No (it was never stored on disk, even with a disk) |
-| Email settings, team login, all environment variables | **Yes**, they're Render settings, not files |
-| Sent emails themselves | Yes, already handed to Resend for delivery |
+| Sending history, uploaded workbook, template, column mapping, team activity, in-flight send claims | **Yes** (MongoDB) |
+| Sign-in sessions | No. Team members sign in again after the service restarts or wakes up. |
+| Email settings, team login, environment variables | Yes (Render settings) |
 
-**What this means in practice:**
-
-- **Duplicate protection only covers emails sent since the last restart.** After the service sleeps or redeploys, the app no longer knows who was already emailed and won't warn before emailing them again. Keep your own record (or check the mailbox) before re-sending to an attorney.
-- **Save the template text somewhere else** (for example in a document), and paste it back into Template Settings after a restart.
-- **The app shows a "Temporary storage" warning** at the top of every page while it runs this way, and the Render log says `Data folder: … (TEMPORARY)`.
-- The first request after the service has been asleep takes up to about a minute while Render starts it.
-
-**To make data permanent later** (no code changes): move the service to a paid instance type, add a persistent disk mounted at `/var/data`, and add the environment variable `DATA_DIR=/var/data`. Don't set `DATA_DIR` without a disk: the server deliberately refuses to start if that folder is missing, so it can't silently lose data.
+- **The server will not start without the database.** `REQUIRE_MONGODB=true` is set in `render.yaml`, and in production the server connects *before* it serves requests. A wrong `MONGODB_URI`, a missing `MONGODB_DB` or `TEAM_MEMBERS`, or Atlas blocking Render all make the deploy **fail with a clear log message**, while the previous version keeps running.
+- **Atlas Network Access must allow `0.0.0.0/0`.** Render Free has no fixed outgoing IP address. Access is still protected by the database user's password.
+- The page shows a green **"Shared database: automail"** badge. If it says "Local files", MongoDB is not in use.
+- The first request after the service has been asleep takes up to about a minute while Render starts it. Interrupted sends are recovered automatically after start-up (see DATABASE-OPERATIONS.md).
+- Atlas M0 has no automatic backups: run `npm run db:backup` regularly.
 
 ---
 
@@ -302,6 +297,12 @@ Add each domain in its platform first. The platform then shows the exact DNS rec
 | `SMTP_FROM` | Yes | `vikram@zodiacpatent.com` | Sender address for both providers. With Resend, its domain must be verified there. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` | Only for `smtp` | | Hostinger SMTP settings; not used with `EMAIL_PROVIDER=resend`. |
 | `PORT` | No | set by Render | Don't set it yourself. |
+| `REQUIRE_MONGODB` | Yes | `true` | Refuse to start without MongoDB (never fall back to temporary files). |
+| `MONGODB_URI` | Yes | `mongodb+srv://<user>:<password>@<cluster>/?retryWrites=true&w=majority` | Atlas connection string. **Secret**: Render dashboard only; never logged or sent to the browser. |
+| `MONGODB_DB` | Yes | `automail` | Database name. Required in production (no default). |
+| `TEAM_MEMBERS` | Yes | `Vikram, Vikram2` | Names offered in "Who is using this browser?" (comma-separated). Required in production. |
+| `AUDIT_CLIENT_IP_HOPS` | Recommended | `2` | Proxies in front of the backend (Vercel + Render) for the activity log's reported client IP. |
+| `ACTIVITY_RETENTION_DAYS` | No | (unset) | Delete team-activity entries older than this many days (minimum 90). Unset keeps them forever. |
 
 ### Vercel (frontend)
 

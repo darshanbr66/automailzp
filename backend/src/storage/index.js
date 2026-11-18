@@ -6,6 +6,8 @@ import { createMongoStorage } from './mongo.js';
  * backend: it is never logged or sent to the browser.
  */
 export function createStorage(config, dataDir) {
-  if (config.mongodb?.uri) return createMongoStorage({ uri: config.mongodb.uri, dbName: config.mongodb.dbName, dataDir });
+  if (config.mongodb?.uri) {
+    return createMongoStorage({ uri: config.mongodb.uri, dbName: config.mongodb.dbName, dataDir, activityRetentionDays: config.mongodb.activityRetentionDays ?? null });
+  }
   return createFileStorage(dataDir);
 }

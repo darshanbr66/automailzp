@@ -70,8 +70,24 @@ export function loadConfig(env = process.env) {
     if (!/^mongodb(\+srv)?:\/\//.test(mongodbUri)) fatal.push('MONGODB_URI must start with mongodb:// or mongodb+srv://');
     else mongodb = { uri: mongodbUri, dbName: clean(env.MONGODB_DB) || 'zodiacpatent' };
   }
+  // Optional: remove team-activity entries older than this many days (off when
+  // unset; at least 90). The sending history is never removed automatically.
+  const retentionRaw = Number(String(env.ACTIVITY_RETENTION_DAYS ?? '').trim());
+  if (mongodb && Number.isFinite(retentionRaw) && retentionRaw > 0) {
+    if (retentionRaw < 90) warnings.push('ACTIVITY_RETENTION_DAYS is below the minimum of 90; 90 days is used.');
+    mongodb.activityRetentionDays = Math.max(90, Math.round(retentionRaw));
+  }
   // Names team members choose from in each browser session (self-declared).
   const teamMembers = parseTeamMembers(env.TEAM_MEMBERS);
+  // REQUIRE_MONGODB=true (set in render.yaml): never fall back to file storage.
+  // Without it a forgotten MONGODB_URI would quietly run on temporary files.
+  const requireMongo = parseBool(env.REQUIRE_MONGODB, false);
+  if (requireMongo && !mongodbUri) fatal.push('MONGODB_URI is not set, but REQUIRE_MONGODB=true: this deployment must use the shared MongoDB database.');
+  if (mongodb && (isProduction || requireMongo)) {
+    // No assumed values in production: the database name and team must be stated.
+    if (!clean(env.MONGODB_DB)) fatal.push('MONGODB_DB must be set to the database name (e.g. automail) when MONGODB_URI is used in production.');
+    if (!String(env.TEAM_MEMBERS || '').trim()) fatal.push('TEAM_MEMBERS must list the team members (comma-separated) when MONGODB_URI is used in production.');
+  }
   // Proxies in front of the backend, for the activity log's reported client IP
   // (production: Vercel + Render's load balancer).
   const hopsRaw = Number.parseInt(String(env.AUDIT_CLIENT_IP_HOPS ?? ''), 10);
