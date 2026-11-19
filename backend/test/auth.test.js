@@ -170,6 +170,13 @@ test('health check is public and minimal; every API endpoint needs a session', a
     assert.equal(health.status, 200);
     assert.equal(health.text, '{"ok":true}');
 
+    // Readiness check used by the sign-in page through the /api proxy: public, no cookie, nothing revealed.
+    const ready = await c.request('GET', '/api/health');
+    assert.equal(ready.status, 200);
+    assert.deepEqual(ready.data, { ok: true, data: { ready: true } });
+    assert.equal(ready.headers.get('cache-control'), 'no-store');
+    assert.equal(ready.headers.get('set-cookie'), null, 'the readiness check never creates a session');
+
     for (const url of ['/api/excel/records', '/api/smtp/status', '/api/history', '/api/template', '/api/mapping', '/api/status']) {
       const r = await c.request('GET', url);
       assert.equal(r.status, 401, url);

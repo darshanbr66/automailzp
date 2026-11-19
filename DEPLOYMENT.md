@@ -265,7 +265,7 @@ Add each domain in its platform first. The platform then shows the exact DNS rec
 
 1. `https://api.zodiacpatent.com/healthz` → `{"ok":true}`.
 2. `https://api.zodiacpatent.com/api/history` → `401` with "Your session has ended. Please sign in again." This confirms the API is protected.
-3. Open `https://app.zodiacpatent.com`. You should see only the **Sign in** page.
+3. Open `https://app.zodiacpatent.com`. You should see only the homepage with the **Sign in** card. Loading it makes no request to Render (it can stay asleep). When **Login** is clicked, the page first polls `/api/health` (proxied to Render, `{"ok":true,"data":{"ready":true}}`, public, no session), shows "Waking up server…" while Render starts (up to ~90 s, then a Retry button), and only then sends the sign-in request, once.
 4. Sign in with the shared username and password.
 5. The top bar shows **Sending as <mailbox>**. Click **Test Email Connection**. It must say it connected to Resend and that zodiacpatent.com is verified (no email is sent).
 6. Upload a workbook, check the mapping and template, then send **one** test email to an address you own.

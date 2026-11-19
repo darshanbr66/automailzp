@@ -24,15 +24,19 @@ function New-AppShortcut([string]$name, [string]$target, [string]$description, [
     Write-Host "Created: $path"
 }
 
-$StartName = 'ZodiacPatent Attorney Email'
-$StopName = 'Stop ZodiacPatent Attorney Email'
+# Own names, so these shortcuts never replace the original (file-based) app's
+# shortcuts, which use the names without "(MongoDB)".
+$StartName = 'ZodiacPatent Attorney Email (MongoDB)'
+$StopName = 'Stop ZodiacPatent Attorney Email (MongoDB)'
 
-# Remove shortcuts with the old names, but only if they point to this app.
-foreach ($old in @('Attorney Email Automation', 'Stop Attorney Email Automation', 'Zodiac Patent Attorney Email', 'Stop Zodiac Patent Attorney Email')) {
+# Remove shortcuts with the old names, but only if they point into THIS folder
+# ("<Root>\", so the original app in a sibling folder is never touched).
+$RootPrefix = $Root.TrimEnd('\') + '\'
+foreach ($old in @('ZodiacPatent Attorney Email', 'Stop ZodiacPatent Attorney Email', 'Attorney Email Automation', 'Stop Attorney Email Automation', 'Zodiac Patent Attorney Email', 'Stop Zodiac Patent Attorney Email')) {
     $oldPath = Join-Path $Desktop "$old.lnk"
     if (Test-Path $oldPath) {
         $target = $Shell.CreateShortcut($oldPath).TargetPath
-        if ($target -and $target.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) {
+        if ($target -and $target.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
             Remove-Item $oldPath -Force
             Write-Host "Removed old shortcut: $oldPath"
         }
