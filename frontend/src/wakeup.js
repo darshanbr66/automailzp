@@ -6,8 +6,27 @@
 // polls the public readiness check (GET /api/health, which sends no cookie data
 // and no credentials) and submits the login only once that check succeeds.
 //
+// A sleeping Render service is NOT woken by requests arriving through the
+// Vercel proxy: Render answers those with an immediate 502 for as long as the
+// service sleeps (measured in production). Only a direct request to the
+// onrender.com address starts it. So before polling, the page also sends one
+// direct "wake" ping to Render's readiness check: a plain no-cors GET with no
+// cookies, no credentials and no body, whose response is never read. Readiness
+// is still decided only by the proxied /api/health check, and the login itself
+// still goes only through the proxy (first-party session cookie, CSRF, Origin
+// checks unchanged).
+//
 // No React or browser globals beyond fetch/AbortController, so it is unit-tested
 // with node --test.
+
+/**
+ * Direct Render address of the public readiness check (same origin as the
+ * /api rewrite destination in frontend/vercel.json, and allowed by its CSP
+ * connect-src). Used only for the wake ping.
+ */
+export const DIRECT_WAKE_URL = 'https://automailzp.onrender.com/api/health';
+/** At most this many wake pings per sign-in attempt (one, plus repeats while the server stays unready). */
+export const MAX_WAKE_PINGS = 3;
 
 export const WAKE_DEFAULTS = Object.freeze({
   /** Give up (and offer Retry) after this long. Render cold starts take ~30-60 s. */
@@ -70,18 +89,52 @@ async function checkOnce(url, fetchImpl, ms, signal) {
 }
 
 /**
+ * Fire-and-forget wake request. `mode: 'no-cors'` + `credentials: 'omit'`: no
+ * cookie, no Authorization, no custom header, no body, no preflight; the
+ * response is never read. Resolves (never rejects) once the request has
+ * finished either way. The outcome says nothing about whether Render received
+ * it: the API sends `Cross-Origin-Resource-Policy: same-site`, so the browser
+ * rejects the cross-site response even though the request reached Render and
+ * woke it (verified in production).
+ */
+export function sendWakePing(url, fetchImpl = globalThis.fetch) {
+  try {
+    return Promise.resolve(
+      fetchImpl(url, { method: 'GET', mode: 'no-cors', credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer' }),
+    ).then(
+      () => true,
+      () => false,
+    );
+  } catch {
+    return Promise.resolve(false);
+  }
+}
+
+/**
+ * Where to send the direct wake ping from this page, or null for none: never
+ * from a local install (its backend is on the same computer and does not
+ * sleep), and not when a custom API address is configured.
+ */
+export function wakePingUrl({ hostname = globalThis.location?.hostname, apiBase = '' } = {}) {
+  if (apiBase || isLocalHost(hostname)) return null;
+  return DIRECT_WAKE_URL;
+}
+
+/**
  * Resolve once the backend answers its readiness check.
  *
  * @param {object} o
  * @param {string} o.url            readiness endpoint, e.g. '/api/health'
+ * @param {string} [o.wakeUrl]      direct address pinged (credential-free) before polling
  * @param {Function} [o.fetchImpl]  defaults to global fetch
  * @param {Function} [o.onWaking]   called once, when the server looks asleep
  * @param {AbortSignal} [o.signal]  cancels the wait (rejects with AbortError)
- * @returns {Promise<{ attempts: number, waited: boolean }>}
+ * @returns {Promise<{ attempts: number, waited: boolean, pings: number }>}
  * @throws {WakeTimeoutError} after `timeoutMs` without a successful check
  */
 export async function waitForBackend({
   url,
+  wakeUrl = null,
   fetchImpl = globalThis.fetch,
   onWaking,
   signal,
@@ -98,6 +151,21 @@ export async function waitForBackend({
     waking = true;
     onWaking?.();
   };
+  // Wake ping: one before the first check. Another only once the previous one
+  // has finished and the proxied check still fails (never two at once; a
+  // sleeping Render holds the first one open while it starts), up to MAX_WAKE_PINGS.
+  let pings = 0;
+  let pingInFlight = false;
+  const ping = () => {
+    pings += 1;
+    pingInFlight = true;
+    sendWakePing(wakeUrl, fetchImpl).then(() => {
+      pingInFlight = false;
+    });
+  };
+  if (signal?.aborted) throw abortError();
+  if (wakeUrl) ping();
+
   const slowTimer = setTimeout(markWaking, slowAfterMs);
   try {
     for (let attempt = 1; ; attempt += 1) {
@@ -106,8 +174,9 @@ export async function waitForBackend({
       if (left <= 0) throw new WakeTimeoutError(attempt - 1);
       const ready = await checkOnce(url, fetchImpl, Math.min(attemptTimeoutMs, left), signal);
       if (signal?.aborted) throw abortError();
-      if (ready) return { attempts: attempt, waited: waking };
+      if (ready) return { attempts: attempt, waited: waking, pings };
       markWaking();
+      if (wakeUrl && !pingInFlight && pings < MAX_WAKE_PINGS) ping();
       const pause = Math.min(delaysMs[Math.min(attempt - 1, delaysMs.length - 1)], deadline - now());
       if (pause <= 0) throw new WakeTimeoutError(attempt);
       await sleep(pause, signal);

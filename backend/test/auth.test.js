@@ -477,15 +477,22 @@ test('requests forwarded by the Vercel proxy are accepted (Host and Origin of th
   }
 });
 
-test('frontend/vercel.json proxies /api to Render before the SPA fallback, with a same-origin CSP', async () => {
+test('frontend/vercel.json proxies /api to Render before the SPA fallback; CSP allows only the Render wake ping besides itself', async () => {
   const vercel = JSON.parse(await fs.readFile(new URL('../../frontend/vercel.json', import.meta.url), 'utf8'));
   assert.deepEqual(vercel.rewrites, [
     { source: '/api/:path*', destination: 'https://automailzp.onrender.com/api/:path*' },
     { source: '/(.*)', destination: '/index.html' },
   ]);
   const csp = vercel.headers.flatMap((h) => h.headers).find((h) => h.key === 'Content-Security-Policy').value;
-  assert.match(csp, /connect-src 'self';/);
-  assert.doesNotMatch(csp, /connect-src[^;]*https?:/, 'the browser never calls another origin');
+  // The only other origin the browser may contact is Render itself, for the
+  // credential-free wake ping (frontend/src/wakeup.js), and it must be the
+  // exact origin the /api rewrite forwards to.
+  const { DIRECT_WAKE_URL } = await import('../../frontend/src/wakeup.js');
+  const renderOrigin = new URL(vercel.rewrites[0].destination.replace(':path*', 'x')).origin;
+  assert.equal(new URL(DIRECT_WAKE_URL).origin, renderOrigin);
+  assert.equal(new URL(DIRECT_WAKE_URL).pathname, '/api/health', 'the ping targets only the public readiness check');
+  assert.match(csp, new RegExp(`connect-src 'self' ${renderOrigin.replace(/[.]/g, '\\.')};`));
+  assert.equal(csp.match(/https?:\/\/[^\s;]+/g).length, 1, 'no other external origin anywhere in the CSP');
 });
 
 test('two signed-in members: a workbook uploaded by Bob makes Alice\'s earlier selection stale (no wrong-recipient send)', async () => {

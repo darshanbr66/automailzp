@@ -11,7 +11,7 @@ export class ApiError extends Error {
 // rewrite in vercel.json forwards them to Render; locally the Vite dev server
 // proxies them. (Optional VITE_API_BASE_URL is only for a same-site API origin.)
 import { getOperator } from './operator.js';
-import { waitForBackend } from './wakeup.js';
+import { waitForBackend, wakePingUrl } from './wakeup.js';
 
 export const API_BASE = String(import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 
@@ -70,9 +70,9 @@ export async function download(path, fallbackName) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-/** Wait until the backend answers its public readiness check (see wakeup.js). */
+/** Wait until the backend answers its public readiness check, pinging Render directly first to wake it (see wakeup.js). */
 export function waitForApi(options = {}) {
-  return waitForBackend({ url: `${API_BASE}/api/health`, ...options });
+  return waitForBackend({ url: `${API_BASE}/api/health`, wakeUrl: wakePingUrl({ apiBase: API_BASE }), ...options });
 }
 
 export async function api(path, { method = 'GET', json, form, timeoutMs } = {}) {
