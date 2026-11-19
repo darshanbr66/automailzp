@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, setAuthRequiredHandler, setCsrfToken, setOperatorRequiredHandler } from './api.js';
 import LoginForm from './components/LoginForm.jsx';
+import HomePage from './components/HomePage.jsx';
+import { RESTORE_TIMEOUT_MS, isLocalHost, setSessionHint, shouldCheckSessionOnLoad } from './wakeup.js';
 import { sessionSentNames } from './sentNames.js';
 import SmtpStatus from './components/SmtpStatus.jsx';
 import ComposePage from './components/ComposePage.jsx';
@@ -28,26 +30,41 @@ const CONFIG_RETRIES = 3;
  * shown (or requested) until the team has signed in. If the session ends while
  * the app is open, the sign-in form appears over the page so unsaved edits
  * are kept.
+ *
+ * On the hosted site the homepage is shown straight away, without contacting the
+ * backend (which may be asleep on Render Free); the sign-in form wakes it. Only a
+ * browser that was signed in before makes one short session check, so a reload
+ * keeps the workspace (see wakeup.js).
  */
 export default function App() {
-  const [auth, setAuth] = useState({ state: 'loading' }); // loading | signin | ready | error
+  // loading | signin | ready | error
+  const [auth, setAuth] = useState(() => (shouldCheckSessionOnLoad() ? { state: 'loading' } : { state: 'signin' }));
   const [workspaceShown, setWorkspaceShown] = useState(false);
 
   const checkSession = useCallback(async () => {
     setAuth({ state: 'loading' });
+    const local = isLocalHost(globalThis.location?.hostname);
     try {
-      const s = await api('/api/auth/session');
+      const s = await api('/api/auth/session', local ? {} : { timeoutMs: RESTORE_TIMEOUT_MS });
       setCsrfToken(s.csrfToken);
+      setSessionHint(s.authenticated && s.authRequired);
       setAuth(s.authenticated ? { state: 'ready', required: s.authRequired, username: s.username } : { state: 'signin' });
     } catch (err) {
-      setAuth({ state: 'error', message: err.message });
+      if (local) {
+        setAuth({ state: 'error', message: err.message });
+      } else {
+        // Hosted: the server was asleep or unreachable, so the earlier session is gone. Sign in again.
+        setSessionHint(false);
+        setAuth({ state: 'signin' });
+      }
     }
   }, []);
 
   useEffect(() => {
-    checkSession();
+    if (shouldCheckSessionOnLoad()) checkSession();
     setAuthRequiredHandler((message) => {
       setCsrfToken(null);
+      setSessionHint(false);
       setAuth({ state: 'signin', message });
     });
     return () => setAuthRequiredHandler(null);
@@ -59,6 +76,7 @@ export default function App() {
 
   const onSignedIn = (s) => {
     setCsrfToken(s.csrfToken);
+    setSessionHint(true);
     setAuth({ state: 'ready', required: true, username: s.username });
   };
 
@@ -69,6 +87,7 @@ export default function App() {
       /* the session is cleared below either way */
     }
     setCsrfToken(null);
+    setSessionHint(false);
     sessionSentNames.clear(); // a new sign-in starts a new list of sent names
     setOperator(null); // and asks again who is using this browser
     setWorkspaceShown(false);
@@ -76,7 +95,7 @@ export default function App() {
   };
 
   if (auth.state === 'loading' && !workspaceShown) {
-    return <div className="auth-screen"><div className="auth-card"><Spinner /> <span className="muted">Loading…</span></div></div>;
+    return <div className="auth-screen"><div className="auth-card"><Spinner /> <span className="muted">Loading your workspace…</span></div></div>;
   }
   if (auth.state === 'error') {
     return (
@@ -89,7 +108,7 @@ export default function App() {
     );
   }
   if (auth.state === 'signin' && !workspaceShown) {
-    return <div className="auth-screen"><LoginForm message={auth.message} onSignedIn={onSignedIn} /></div>;
+    return <HomePage message={auth.message} onSignedIn={onSignedIn} />;
   }
   return (
     <>

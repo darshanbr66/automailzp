@@ -37,9 +37,12 @@ function Get-PortOwner([int]$port) {
     $procId = [int]$conn.OwningProcess
     $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue
     $cmd = if ($proc) { [string]$proc.CommandLine } else { '' }
-    # Our processes are started with absolute script paths inside this folder.
-    $ours = $cmd -and ($cmd.IndexOf($Root, [StringComparison]::OrdinalIgnoreCase) -ge 0)
-    return [pscustomobject]@{ Pid = $procId; Name = $(if ($proc) { $proc.Name } else { 'unknown' }); Ours = $ours }
+    # Our processes are started with absolute script paths inside this folder. Match
+    # "<Root>\" so a sibling folder such as "<Root>-copy" is not mistaken for this app.
+    $ours = $cmd -and ($cmd.IndexOf($Root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -ge 0)
+    # Which project folder the other program runs from (shown in the error message).
+    $where = if ($cmd -match '([A-Za-z]:\\[^"]*?)\\(?:frontend|backend|node_modules)\\') { $Matches[1] } else { $cmd }
+    return [pscustomobject]@{ Pid = $procId; Name = $(if ($proc) { $proc.Name } else { 'unknown' }); Ours = $ours; Where = $where }
 }
 
 function Get-LogTail([string]$path) {
@@ -90,7 +93,8 @@ function Start-App {
     foreach ($port in @($BackendPort, $FrontendPort)) {
         $owner = Get-PortOwner $port
         if ($owner -and -not $owner.Ours) {
-            Show-Error "Port $port is already used by another program ($($owner.Name), process $($owner.Pid)).`n`nZodiacPatent Attorney Email Automation needs ports $BackendPort and $FrontendPort. Close the other program (for example another development server) and try again."
+            $from = if ($owner.Where) { "`nIt runs from: $($owner.Where)" } else { '' }
+            Show-Error "Port $port is already used by another program ($($owner.Name), process $($owner.Pid)).$from`n`nThis copy of ZodiacPatent Attorney Email Automation ($Root) needs ports $BackendPort and $FrontendPort (set in backend\.env). It does not switch to another port, so it can never be confused with a different app. Close the other program (for example another development server) and try again."
         }
     }
 

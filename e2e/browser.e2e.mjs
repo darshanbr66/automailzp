@@ -84,6 +84,7 @@ const { MongoMemoryServer } = await importBackendDep('mongodb-memory-server');
 const { createApp } = await importRepo('backend/src/app.js');
 const { createMongoStorage } = await importRepo('backend/src/storage/mongo.js');
 const { fakeTransport, makeMailer, makeWorkbookBuffer, smtpError, testConfig } = await importRepo('backend/test/helpers.js');
+const { hashPassword } = await importRepo('backend/src/auth.js');
 
 // ---- Test environment ---------------------------------------------------------------
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'zp-e2e-'));
@@ -141,6 +142,47 @@ async function startServer() {
   return { base, smtp };
 }
 
+// Second server for the homepage: sign-in turned on, reached under a host name
+// that is not "localhost" (Chrome maps it to 127.0.0.1), so the browser behaves
+// as on the hosted site. GET /api/health can be made to fail like the Vercel
+// proxy while Render Free wakes up.
+const HOME_HOST = 'zp-home.test';
+const HOME_USER = 'zodiac-team';
+const HOME_PASSWORD = 'e2e correct horse battery staple';
+const homeFaults = { healthFailures: 0 };
+const homeRequests = [];
+let homeServer;
+
+async function startHomeServer() {
+  const homeData = path.join(tmp, 'home-data');
+  await fs.mkdir(homeData);
+  const outer = express();
+  let inner = null;
+  outer.use((req, res, next) => {
+    if (req.path.startsWith('/api/')) homeRequests.push({ method: req.method, path: req.path, at: Date.now() });
+    if (req.path === '/api/health' && homeFaults.healthFailures > 0) {
+      homeFaults.healthFailures -= 1;
+      return res.status(502).send('<html>Bad gateway</html>');
+    }
+    return inner(req, res, next);
+  });
+  outer.use(express.static(DIST));
+  homeServer = await new Promise((resolve) => {
+    const s = outer.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  const homeBase = `http://${HOME_HOST}:${homeServer.address().port}`;
+  const config = testConfig({
+    FRONTEND_URL: homeBase,
+    ALLOWED_HOSTS: HOME_HOST,
+    APP_USERNAME: HOME_USER,
+    APP_PASSWORD_HASH: await hashPassword(HOME_PASSWORD),
+    SESSION_SECRET: 'e2e-session-secret-0123456789-abcdefghijklmnop',
+  });
+  if (config.fatal.length) throw new Error(`home server config: ${config.fatal.join('; ')}`);
+  inner = createApp({ config, dataDir: homeData, mailer: makeMailer(fakeTransport(), config) });
+  return homeBase;
+}
+
 // ---- Minimal DevTools protocol client -----------------------------------------
 let msgId = 0;
 const pending = new Map();
@@ -158,6 +200,7 @@ async function startChrome() {
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-extensions',
+    `--host-resolver-rules=MAP ${HOME_HOST} 127.0.0.1`,
     'about:blank',
   ];
   if (process.env.E2E_HEADED !== '1') args.unshift('--headless=new');
@@ -192,7 +235,8 @@ async function startChrome() {
 async function openUser(base) {
   const ctx = (await call('Target.createBrowserContext')).browserContextId;
   for (const name of ['clipboard-write', 'clipboard-read']) {
-    await call('Browser.setPermission', { browserContextId: ctx, origin: base, permission: { name, allowWithoutSanitization: true }, setting: 'granted' });
+    // Not grantable on a plain-http non-localhost origin (the homepage scenario, which needs no clipboard).
+    await call('Browser.setPermission', { browserContextId: ctx, origin: base, permission: { name, allowWithoutSanitization: true }, setting: 'granted' }).catch(() => {});
   }
   const { targetId } = await call('Target.createTarget', { url: 'about:blank', browserContextId: ctx });
   const { sessionId } = await call('Target.attachToTarget', { targetId, flatten: true });
@@ -425,6 +469,96 @@ async function operatorPromptResilience(base) {
   }
 }
 
+/** Homepage: no backend request on load, validation, and the Render cold-start sign-in. */
+async function homepageColdStart(homeBase) {
+  out('\n# Homepage and Render cold-start sign-in (login enabled, hosted-style address)');
+  const logins = () => homeRequests.filter((r) => r.path === '/api/auth/login');
+  const health = () => homeRequests.filter((r) => r.path === '/api/health');
+  const submitBtn = `document.querySelector('.home-login form button[type=submit]')`;
+
+  const u = await openUser(homeBase);
+  homeRequests.length = 0;
+  await u.cdp('Page.navigate', { url: homeBase });
+  const shown = await u.waitFor(`document.querySelector('h1.login-title')?.textContent === 'Sign in' && document.querySelector('.signin-brand')?.textContent.includes('ZodiacPatent')`);
+  await sleep(1200);
+  check('H1. sign-in screen shows the ZodiacPatent brand and makes no backend request on load', shown && homeRequests.length === 0, homeRequests);
+  const noScroll = (label) => u.js(`const d=document.documentElement; return { v: d.scrollHeight - d.clientHeight, h: d.scrollWidth - d.clientWidth, label: ${JSON.stringify(label)} }`);
+  const desk = await noScroll('1400x900');
+  check('H2. desktop: no scrolling', desk.v <= 0 && desk.h <= 0, desk);
+  const centred = await u.js(`const d=document.querySelector('.dial').getBoundingClientRect(), f=document.querySelector('.home-login form').getBoundingClientRect(); return { dx: Math.round((d.x+d.width/2)-(f.x+f.width/2)), formInsideDial: f.left > d.left && f.right < d.right && f.top > d.top && f.bottom < d.bottom }`);
+  check('H3. the form sits centred inside the dial; no data or marketing content on the page', centred.dx === 0 && centred.formInsideDial && (await u.js(`return !document.querySelector('table, .preview-window, .aside-points, .home-feature')`)), centred);
+
+  await u.js(`${submitBtn}.click(); return true`);
+  await u.waitFor(`document.querySelectorAll('.field-error').length === 2`);
+  check('H4. empty form: both fields flagged, nothing sent', (await u.js(`return document.querySelectorAll('.field-error').length`)) === 2 && homeRequests.length === 0, homeRequests);
+
+  await u.typeInto('#login-password', 'abc');
+  await u.js(`document.querySelector('.password-toggle').click(); return true`);
+  const shownType = await u.js(`return document.querySelector('#login-password').type`);
+  await u.js(`document.querySelector('.password-toggle').click(); return true`);
+  check('H5. show/hide password toggle', shownType === 'text' && (await u.js(`return document.querySelector('#login-password').type`)) === 'password');
+
+  // Wrong password: one readiness check, one login, a clear message, password cleared.
+  await u.typeInto('#login-username', HOME_USER);
+  await u.typeInto('#login-password', 'wrong password');
+  await u.js(`${submitBtn}.click(); return true`);
+  const failed = await u.waitFor(`document.querySelector('.home-login .alert-error')?.textContent.includes('Incorrect username or password')`);
+  check(
+    'H6. wrong password: "Login failed" message, password cleared, exactly one login request',
+    failed && (await u.js(`return document.querySelector('.home-login .alert-error').textContent.startsWith('Login failed') && document.querySelector('#login-password').value === ''`)) && logins().length === 1,
+    { logins: logins().length },
+  );
+
+  // Sleeping server: the readiness check fails 4 times (502, like Vercel while Render wakes).
+  homeRequests.length = 0;
+  homeFaults.healthFailures = 4;
+  await u.typeInto('#login-password', HOME_PASSWORD);
+  await u.js(`const f=document.querySelector('.home-login form'); ${submitBtn}.click(); f.requestSubmit(); f.requestSubmit(); return true`);
+  const waking = await u.waitFor(`${submitBtn}.textContent.includes('Waking up server') && document.querySelector('.login-status')?.textContent.includes('up to a minute')`, 8000);
+  const lockedWhileWaking = await u.js(`return ${submitBtn}.disabled && document.querySelector('#login-username').disabled && document.querySelector('#login-password').disabled`);
+  await u.js(`const f=document.querySelector('.home-login form'); f.requestSubmit(); ${submitBtn}.click(); return true`);
+  check('H7. "Waking up server… up to a minute" while the server starts, and the dial shows activity', waking && (await u.js(`return document.querySelector('.dial').classList.contains('is-busy')`)));
+  check('H8. form locked while waking (repeated clicks ignored)', lockedWhileWaking);
+  const entered = await u.waitFor(`document.querySelectorAll('.tab').length === 5`, 30000);
+  const failedHealth = health().slice(0, 4);
+  check(
+    'H9. once ready, the login is sent exactly once, after the readiness check succeeded',
+    entered && logins().length === 1 && health().length >= 5 && logins()[0].at >= failedHealth[failedHealth.length - 1].at,
+    { logins: logins().length, health: health().length },
+  );
+  check(
+    'H10. polling never carried credentials (only GET /api/health before the login)',
+    homeRequests.filter((r) => r.at <= (logins()[0]?.at ?? 0) && r.path !== '/api/auth/login').every((r) => r.method === 'GET' && r.path === '/api/health'),
+    homeRequests,
+  );
+  check('H11. the session hint is a flag only', (await u.js(`return localStorage.getItem('zp-signed-in')`)) === '1');
+
+  // Reload: the workspace comes back without signing in again.
+  homeRequests.length = 0;
+  await u.cdp('Page.reload');
+  await sleep(300);
+  const restored = await u.waitFor(`document.querySelectorAll('.tab').length === 5`, 10000);
+  check('H12. reload after sign-in restores the workspace (no new login)', restored && logins().length === 0, homeRequests.map((r) => r.path));
+
+  // Sign out: back to the homepage, which again loads without backend requests.
+  await u.click('.session-info button', 'Sign out');
+  await u.waitFor(`document.querySelector('.lp h1.login-title')`);
+  homeRequests.length = 0;
+  await u.cdp('Page.reload');
+  await sleep(300);
+  await u.waitFor(`document.querySelector('.lp h1.login-title')`);
+  await sleep(800);
+  check('H13. after signing out, the homepage reloads with no backend request', homeRequests.length === 0 && (await u.js(`return localStorage.getItem('zp-signed-in')`)) === null, homeRequests);
+
+  for (const [w, h, name] of [[1366, 768, 'laptop'], [1280, 720, 'small laptop'], [820, 1180, 'tablet'], [390, 844, 'phone'], [375, 667, 'small phone']]) {
+    await u.cdp('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: w < 600 });
+    await sleep(200);
+    const m = await u.js(`const d=document.documentElement, b=document.querySelector('.home-login button[type=submit]').getBoundingClientRect(), brand=document.querySelector('.lp-brand').getBoundingClientRect(), t=document.querySelector('h1.login-title').getBoundingClientRect(); return { v: d.scrollHeight - d.clientHeight, h: d.scrollWidth - d.clientWidth, buttonVisible: b.bottom <= innerHeight, brandClear: brand.bottom <= t.top }`);
+    check(`H14. ${name} ${w}x${h}: everything visible without scrolling`, m.v <= 0 && m.h <= 0 && m.buttonVisible && m.brandClear, m);
+  }
+  await u.close();
+}
+
 // ---- Run ---------------------------------------------------------------------------------
 const watchdog = setTimeout(() => {
   out(`ERROR timed out after ${OVERALL_TIMEOUT_MS / 1000}s`);
@@ -446,6 +580,7 @@ async function cleanup() {
     await Promise.race([exited, sleep(5000)]);
   }
   await new Promise((r) => (server ? server.close(() => r()) : r()));
+  await new Promise((r) => (homeServer ? homeServer.close(() => r()) : r()));
   await storage?.close().catch(() => {});
   await mongod?.stop().catch(() => {});
   // Chrome can hold profile files briefly after exit (Windows).
@@ -467,6 +602,7 @@ try {
   console.warn = () => {};
   console.error = () => {};
   const { base, smtp } = await startServer();
+  const homeBase = await startHomeServer();
   await startChrome();
   for (const scenario of [teamWorkflow, uncertainReconciliation, operatorPromptResilience]) {
     try {
@@ -475,6 +611,12 @@ try {
       crashed = true;
       out(`ERROR in ${scenario.name}: ${err.stack || err.message}`);
     }
+  }
+  try {
+    await homepageColdStart(homeBase);
+  } catch (err) {
+    crashed = true;
+    out(`ERROR in homepageColdStart: ${err.stack || err.message}`);
   }
 } catch (err) {
   crashed = true;

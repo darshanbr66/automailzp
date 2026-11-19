@@ -306,3 +306,142 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--p
 .operator-choice { display: flex; align-items: center; gap: 8px; font-size: var(--fs-body); cursor: pointer; }
 .voided-row td { color: var(--muted); }
 .voided-row td:not(:last-child) { text-decoration: line-through; text-decoration-color: rgba(100, 112, 127, 0.5); }
+
+/* ==== Sign-in form: shared parts (sign-in page and the "session ended" pop-up) ==== */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.login-title { margin: 0 0 4px; font-size: var(--fs-h3); font-weight: 600; color: var(--text); }
+.login-lead { margin: 0 0 14px; font-size: var(--fs-body); }
+.field-error { color: var(--error); font-size: var(--fs-small); }
+.field input[aria-invalid="true"] { border-color: var(--error); }
+.password-wrap { position: relative; display: block; }
+.password-wrap input { padding-right: 64px !important; }
+.password-toggle {
+  position: absolute; top: 50%; right: 6px; transform: translateY(-50%);
+  border: 0; background: none; color: var(--primary); font: inherit; font-size: 12.5px; font-weight: 600; padding: 4px 8px; border-radius: 6px; cursor: pointer;
+}
+.password-toggle:hover:not(:disabled) { background: var(--primary-soft); }
+.password-toggle:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.password-toggle:disabled { opacity: 0.45; cursor: not-allowed; }
+.login-status-area { min-height: 40px; margin-top: 14px; }
+.auth-note { margin: 0; text-align: center; }
+.login-status { font-size: 13px; color: var(--muted); }
+.login-status-line { display: block; line-height: 1.5; }
+.login-status strong { font-weight: 600; color: var(--text); }
+.login-status-text { display: block; }
+.login-progress { position: relative; display: block; height: 3px; margin-top: 10px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.login-progress span { position: absolute; top: 0; bottom: 0; left: 0; width: 35%; border-radius: 3px; background: var(--primary); animation: lp-progress 1.6s ease-in-out infinite; }
+@keyframes lp-progress { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+
+/* ==== Sign-in page: "the instrument" =============================================
+   A night-navy field, one soft light, and an engraved dial (twelve divisions)
+   with the form set inside it. The dial's accent arc sweeps while signing in. */
+.lp {
+  --lp-ink: #eef3fa;
+  --lp-soft: rgba(214, 226, 243, 0.62);
+  --lp-faint: rgba(214, 226, 243, 0.4);
+  --lp-line: rgba(255, 255, 255, 0.1);
+  --lp-accent: #8fb4ff;
+  --dial: min(680px, 90vh, 94vw);
+  position: relative; height: 100vh; height: 100dvh; overflow: hidden; isolation: isolate;
+  color: var(--lp-ink);
+  background:
+    radial-gradient(circle at 50% 50%, rgba(70, 116, 196, 0.2) 0, rgba(70, 116, 196, 0.07) 26%, transparent 52%),
+    radial-gradient(120% 70% at 50% 115%, rgba(30, 58, 95, 0.6), transparent 62%),
+    linear-gradient(180deg, #060a13 0%, #08101d 100%);
+}
+/* Fine film grain, so the dark field has texture instead of flat banding. */
+.lp::after {
+  content: ''; position: absolute; inset: 0; z-index: -1; pointer-events: none; opacity: 0.07; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* -- Brand -------------------------------------------------------------------------- */
+.lp-brand { position: absolute; z-index: 2; top: 32px; left: 40px; display: flex; align-items: center; gap: 12px; }
+.lp-brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+.lp-brand-name { font-size: 15px; font-weight: 600; letter-spacing: 0.01em; color: var(--lp-ink); }
+.lp-brand-product { font-size: 12px; letter-spacing: 0.02em; color: var(--lp-faint); }
+.logo-mark-ring { fill: none; stroke: rgba(238, 243, 250, 0.85); stroke-width: 1.4; }
+.logo-mark-tick { stroke: rgba(238, 243, 250, 0.85); stroke-width: 1.2; stroke-linecap: round; }
+.logo-mark-core { fill: var(--lp-accent, #8fb4ff); }
+.logo-mark-star { fill: var(--lp-accent, #8fb4ff); }
+
+/* -- Dial ----------------------------------------------------------------------------- */
+.lp-stage { position: absolute; inset: 0; display: grid; place-items: center; }
+.dial { position: absolute; left: 50%; top: 50%; width: var(--dial); height: var(--dial); transform: translate(-50%, -50%); overflow: visible; pointer-events: none; }
+.dial-halo { fill: rgba(7, 13, 25, 0.55); stroke: rgba(255, 255, 255, 0.04); stroke-width: 1; }
+.dial-ring { fill: none; stroke: rgba(170, 196, 236, 0.24); stroke-width: 1; }
+.dial-inner { fill: none; stroke: rgba(170, 196, 236, 0.07); stroke-width: 1; }
+.dial-tick { stroke: rgba(170, 196, 236, 0.2); stroke-width: 1; }
+.dial-tick-major { stroke: rgba(214, 228, 250, 0.55); stroke-width: 1.5; }
+/* Both groups are symmetric around the dial centre, so their own box centre is the pivot. */
+.dial-turn, .dial-sweep { transform-box: fill-box; transform-origin: center; }
+.dial-turn { animation: lp-turn 240s linear infinite; }
+.dial-arc { fill: none; stroke: var(--lp-accent); stroke-width: 2; stroke-linecap: round; opacity: 0.85; filter: drop-shadow(0 0 6px rgba(143, 180, 255, 0.75)); }
+.dial-star { fill: #d6e5ff; filter: drop-shadow(0 0 5px rgba(143, 180, 255, 0.9)); }
+.dial-sweep { transition: opacity 0.3s; }
+.dial.is-busy .dial-sweep { animation: lp-turn 2.4s linear infinite; }
+.dial.is-busy .dial-arc { opacity: 1; }
+@keyframes lp-turn { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .dial-turn, .dial.is-busy .dial-sweep { animation: none; }
+  .login-progress span { animation: none; width: 100%; opacity: 0.35; }
+}
+
+/* -- Form, set inside the dial --------------------------------------------------------- */
+.lp-form { position: relative; z-index: 1; width: min(320px, calc(100% - 48px)); }
+.login-stage { width: 100%; max-width: none; padding: 0; border: 0; border-radius: 0; box-shadow: none; background: none; color: var(--lp-ink); }
+.login-stage .login-title { margin: 0 0 6px; text-align: center; font-size: 28px; line-height: 1.2; font-weight: 600; letter-spacing: -0.02em; color: var(--lp-ink); }
+.login-stage .login-lead { margin: 0 0 28px; text-align: center; font-size: 14px; color: var(--lp-soft); }
+.login-stage .field { gap: 8px; margin-bottom: 16px; }
+.login-stage .field-label { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--lp-faint); }
+.login-stage input[type="text"], .login-stage input[type="password"] {
+  height: 44px; padding: 0 14px; border-radius: 10px; font-size: 14.5px; color: var(--lp-ink); caret-color: var(--lp-accent);
+  background: rgba(255, 255, 255, 0.04); border: 1px solid var(--lp-line);
+  transition: border-color 0.15s, background-color 0.15s, box-shadow 0.15s;
+}
+.login-stage input:hover:not(:disabled):not(:focus) { border-color: rgba(255, 255, 255, 0.2); }
+.login-stage input:focus { border-color: var(--lp-accent); background: rgba(255, 255, 255, 0.06); box-shadow: 0 0 0 4px rgba(143, 180, 255, 0.14); }
+.login-stage input:disabled { opacity: 0.55; }
+/* Browser autofill would otherwise paint the dark fields white/yellow. */
+.login-stage input:-webkit-autofill, .login-stage input:-webkit-autofill:hover, .login-stage input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--lp-ink); caret-color: var(--lp-accent);
+  box-shadow: 0 0 0 1000px #0f1828 inset; transition: background-color 99999s;
+}
+.login-stage .field input[aria-invalid="true"] { border-color: rgba(255, 128, 128, 0.7); }
+.login-stage .field input[aria-invalid="true"]:focus { box-shadow: 0 0 0 4px rgba(255, 128, 128, 0.14); }
+.login-stage .field-error { color: #ffa3a3; font-size: 12.5px; }
+.login-stage .password-toggle { color: var(--lp-soft); font-size: 12px; letter-spacing: 0.02em; }
+.login-stage .password-toggle:hover:not(:disabled) { background: rgba(255, 255, 255, 0.07); color: var(--lp-ink); }
+.login-stage .password-toggle:focus-visible { outline-color: var(--lp-accent); }
+
+.login-stage .auth-submit {
+  width: 100%; height: 46px; margin-top: 10px; border: 0; border-radius: 10px; font-size: 14.5px; font-weight: 600; letter-spacing: 0.01em;
+  background: var(--lp-ink); color: #0a1322; transition: background 0.15s, box-shadow 0.2s, transform 0.15s;
+}
+.login-stage .auth-submit:hover:not(:disabled) { background: #fff; box-shadow: 0 10px 34px -10px rgba(143, 180, 255, 0.7); }
+.login-stage .auth-submit:active:not(:disabled) { transform: translateY(1px); }
+.login-stage .auth-submit:focus-visible { outline: 2px solid var(--lp-accent); outline-offset: 3px; }
+.login-stage .auth-submit:disabled { opacity: 1; cursor: progress; background: rgba(238, 243, 250, 0.12); color: rgba(238, 243, 250, 0.82); }
+
+.login-stage .login-status-area { min-height: 40px; margin-top: 16px; text-align: center; }
+.login-stage .login-status { font-size: 12.5px; line-height: 1.55; color: var(--lp-soft); }
+
+.login-stage .alert { margin: 0 0 18px; padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.5; }
+.login-stage .alert-error { background: rgba(255, 99, 99, 0.09); border-color: rgba(255, 128, 128, 0.32); color: #ffc7c7; }
+.login-stage .alert-warning { background: rgba(255, 196, 92, 0.08); border-color: rgba(255, 196, 92, 0.3); color: #ffe0a8; }
+.login-stage .alert-info { background: rgba(143, 180, 255, 0.08); border-color: rgba(143, 180, 255, 0.28); color: #d3e2ff; }
+
+/* -- Smaller screens ------------------------------------------------------------------- */
+@media (max-height: 760px) {
+  .login-stage .login-lead { margin-bottom: 22px; }
+  .login-stage .field { margin-bottom: 12px; }
+}
+@media (max-width: 640px) {
+  /* The dial grows past the screen edges and sits behind the form as an engraved backdrop. */
+  .lp { --dial: max(560px, 150vw); }
+  .lp-brand { top: 22px; left: 20px; }
+  .lp-stage { padding: 72px 0 24px; }
+  .lp-form { width: calc(100% - 40px); max-width: 380px; }
+  .dial-halo { fill: rgba(7, 13, 25, 0.4); }
+  .login-stage .login-title { font-size: 26px; }
+}

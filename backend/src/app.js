@@ -19,7 +19,7 @@ import { countsAsSent, matchHistory, normalizeEmail, normalizeText, recordIdenti
 
 const CSRF_HEADER = 'x-oea-request';
 const CSRF_TOKEN_HEADER = 'x-csrf-token';
-const AUTH_PUBLIC_PATHS = new Set(['/auth/session', '/auth/login', '/auth/logout']);
+const AUTH_PUBLIC_PATHS = new Set(['/health', '/auth/session', '/auth/login', '/auth/logout']);
 const REQUEST_ID_RE = /^[A-Za-z0-9-]{8,100}$/;
 export const PAGE_SIZE = 10;
 const MAX_QUERY = 200;
@@ -75,14 +75,11 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
 
   // ---- Health check (Render) -----------------------------------------------
   // Public and minimal: reports only whether the service and its data folder are usable.
+  const dataDirWritable = () => fs.access(dataDir, fs.constants.W_OK).then(() => true, () => false);
   app.get('/healthz', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    try {
-      await fs.access(dataDir, fs.constants.W_OK);
-      res.json({ ok: true });
-    } catch {
-      res.status(503).json({ ok: false });
-    }
+    if (await dataDirWritable()) res.json({ ok: true });
+    else res.status(503).json({ ok: false });
   });
 
   // ---- Host check and security headers ---------------------------------------
@@ -150,6 +147,14 @@ export function createApp({ config, dataDir, mailer, loginLimiter = new LoginLim
     const session = await sessions.get(id);
     return session ? { id, session } : null;
   }
+
+  // Readiness check for the sign-in page, reachable through the frontend's /api
+  // proxy (Vercel only forwards /api/*). Same check and same minimal answer as
+  // /healthz; it never touches sessions or credentials.
+  app.get('/api/health', async (req, res) => {
+    if (await dataDirWritable()) res.json({ ok: true, data: { ready: true } });
+    else res.status(503).json({ ok: false, error: { code: 'NOT_READY', message: 'The server is starting.' } });
+  });
 
   app.get('/api/auth/session', async (req, res) => {
     if (!authEnabled) return res.json({ ok: true, data: { authRequired: false, authenticated: true } });
