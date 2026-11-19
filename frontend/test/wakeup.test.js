@@ -1,7 +1,19 @@
 // Unit tests for the Render cold-start handling (no browser or server needed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SESSION_HINT_KEY, WakeTimeoutError, hasSessionHint, isLocalHost, setSessionHint, shouldCheckSessionOnLoad, waitForBackend } from '../src/wakeup.js';
+import {
+  DIRECT_WAKE_URL,
+  MAX_WAKE_PINGS,
+  SESSION_HINT_KEY,
+  WakeTimeoutError,
+  hasSessionHint,
+  isLocalHost,
+  sendWakePing,
+  setSessionHint,
+  shouldCheckSessionOnLoad,
+  waitForBackend,
+  wakePingUrl,
+} from '../src/wakeup.js';
 
 const json = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 const FAST = { delaysMs: [5], slowAfterMs: 1000, attemptTimeoutMs: 200 };
@@ -25,7 +37,7 @@ test('an awake server: one request, no "waking" state', async () => {
   const { impl, calls } = scripted([json(200, { ok: true, data: { ready: true } })]);
   let waking = 0;
   const r = await waitForBackend({ url: '/api/health', fetchImpl: impl, onWaking: () => waking++, ...FAST });
-  assert.deepEqual(r, { attempts: 1, waited: false });
+  assert.deepEqual(r, { attempts: 1, waited: false, pings: 0 });
   assert.equal(calls.length, 1);
   assert.equal(waking, 0);
   assert.equal(calls[0].url, '/api/health');
@@ -105,4 +117,99 @@ test('session check on load: only for a local install or a browser that signed i
   } finally {
     delete globalThis.localStorage;
   }
+});
+
+// ---- Direct wake ping (Render ignores wake-ups that arrive through the Vercel proxy) ----
+
+const WAKE = 'https://render.example/api/health';
+const isPing = (c) => c.url === WAKE;
+
+/** fetch stand-in: the proxied check follows `steps`; the direct ping answers with `pingResult`. */
+function withPing(steps, pingResult = 'opaque') {
+  const proxied = scripted(steps);
+  const calls = [];
+  const impl = async (url, init) => {
+    calls.push({ url, init });
+    if (url === WAKE) {
+      if (pingResult === 'throw') throw new TypeError('Failed to fetch'); // e.g. the CORP-blocked response
+      if (pingResult === 'hang') return new Promise(() => {}); // a sleeping Render holds it open while starting
+      return { ok: false, status: 0, type: 'opaque' };
+    }
+    return proxied.impl(url, init);
+  };
+  return { impl, calls };
+}
+
+test('wake ping: sent once, before the first readiness check, without any credentials', async () => {
+  const { impl, calls } = withPing([json(502, null), json(502, null), json(200, { ok: true })], 'hang');
+  const r = await waitForBackend({ url: '/api/health', wakeUrl: WAKE, fetchImpl: impl, ...FAST });
+  assert.equal(r.attempts, 3);
+  assert.equal(r.pings, 1);
+  assert.equal(calls.filter(isPing).length, 1, 'one ping while it is still open, even though the proxied check failed twice');
+  assert.ok(isPing(calls[0]), 'the ping goes out before the first proxied check');
+  const { init } = calls[0];
+  assert.equal(init.method, 'GET');
+  assert.equal(init.mode, 'no-cors', 'no preflight, response never read');
+  assert.equal(init.credentials, 'omit', 'no cookies');
+  assert.equal(init.body, undefined, 'no body: username and password are never sent');
+  assert.equal(init.headers, undefined, 'no custom headers (no CSRF token, no operator)');
+  assert.equal(init.referrerPolicy, 'no-referrer');
+  assert.equal(calls.filter((c) => !isPing(c)).every((c) => c.url === '/api/health'), true, 'readiness is still judged through the proxy');
+});
+
+test('wake ping: its (opaque) answer never counts as readiness', async () => {
+  const { impl, calls } = withPing([json(502, null)]);
+  await assert.rejects(
+    waitForBackend({ url: '/api/health', wakeUrl: WAKE, fetchImpl: impl, timeoutMs: 80, attemptTimeoutMs: 20, delaysMs: [5], slowAfterMs: 5 }),
+    (err) => err.code === 'WAKE_TIMEOUT',
+  );
+  assert.ok(calls.filter(isPing).length >= 1);
+});
+
+test('wake ping: repeated only after the previous one finished while the server stays unready, at most MAX_WAKE_PINGS times', async () => {
+  for (const outcome of ['throw', 'opaque']) {
+    const { impl, calls } = withPing([json(502, null)], outcome);
+    await assert.rejects(
+      waitForBackend({ url: '/api/health', wakeUrl: WAKE, fetchImpl: impl, timeoutMs: 300, attemptTimeoutMs: 20, delaysMs: [5], slowAfterMs: 5 }),
+      (err) => err.code === 'WAKE_TIMEOUT',
+    );
+    assert.equal(calls.filter(isPing).length, MAX_WAKE_PINGS, outcome);
+  }
+});
+
+test('wake ping: an awake server gets exactly one ping, whatever the browser makes of its answer', async () => {
+  for (const outcome of ['throw', 'opaque', 'hang']) {
+    const { impl, calls } = withPing([json(200, { ok: true })], outcome);
+    const r = await waitForBackend({ url: '/api/health', wakeUrl: WAKE, fetchImpl: impl, ...FAST });
+    assert.equal(r.attempts, 1);
+    assert.equal(calls.filter(isPing).length, 1, outcome);
+  }
+});
+
+test('wake ping: a failing ping never breaks the readiness polling', async () => {
+  const { impl } = withPing([json(502, null), json(200, { ok: true })], 'throw');
+  const r = await waitForBackend({ url: '/api/health', wakeUrl: WAKE, fetchImpl: impl, ...FAST });
+  assert.equal(r.attempts, 2);
+  assert.equal(await sendWakePing(WAKE, () => { throw new TypeError('blocked by CSP'); }), false, 'a synchronous throw is contained');
+  assert.equal(await sendWakePing(WAKE, async () => { throw new TypeError('Failed to fetch'); }), false, 'a rejected ping resolves, never rejects');
+});
+
+test('wake ping: none without a wake URL, and none after cancelling', async () => {
+  const a = withPing([json(200, { ok: true })]);
+  await waitForBackend({ url: '/api/health', fetchImpl: a.impl, ...FAST });
+  assert.equal(a.calls.filter(isPing).length, 0);
+
+  const b = withPing([json(200, { ok: true })]);
+  const ctl = new AbortController();
+  ctl.abort();
+  await assert.rejects(waitForBackend({ url: '/api/health', wakeUrl: WAKE, fetchImpl: b.impl, signal: ctl.signal, ...FAST }), { name: 'AbortError' });
+  assert.equal(b.calls.length, 0, 'an already-cancelled wait sends nothing');
+});
+
+test('wake ping target: the hosted site pings Render directly; a local install never does', () => {
+  assert.equal(DIRECT_WAKE_URL, 'https://automailzp.onrender.com/api/health');
+  assert.equal(wakePingUrl({ hostname: 'automailzp.vercel.app' }), DIRECT_WAKE_URL);
+  assert.equal(wakePingUrl({ hostname: 'localhost' }), null);
+  assert.equal(wakePingUrl({ hostname: '127.0.0.1' }), null);
+  assert.equal(wakePingUrl({ hostname: 'automailzp.vercel.app', apiBase: 'https://api.example.com' }), null, 'custom API address: no ping');
 });

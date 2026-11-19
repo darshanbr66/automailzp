@@ -144,14 +144,25 @@ async function startServer() {
 
 // Second server for the homepage: sign-in turned on, reached under a host name
 // that is not "localhost" (Chrome maps it to 127.0.0.1), so the browser behaves
-// as on the hosted site. GET /api/health can be made to fail like the Vercel
-// proxy while Render Free wakes up.
+// as on the hosted site, with the production CSP from frontend/vercel.json.
+// GET /api/health can be made to fail like the Vercel proxy while Render Free
+// wakes up, or to keep failing until Render is pinged directly (what production
+// does: a sleeping Render is not woken by requests through the Vercel proxy).
 const HOME_HOST = 'zp-home.test';
 const HOME_USER = 'zodiac-team';
 const HOME_PASSWORD = 'e2e correct horse battery staple';
-const homeFaults = { healthFailures: 0 };
+const homeFaults = { healthFailures: 0, asleepUntilPing: false };
 const homeRequests = [];
 let homeServer;
+const VERCEL_JSON = JSON.parse(await fs.readFile(path.join(ROOT, 'frontend', 'vercel.json'), 'utf8'));
+const VERCEL_CSP = VERCEL_JSON.headers.flatMap((h) => h.headers).find((h) => h.key === 'Content-Security-Policy').value;
+
+// The direct wake ping (frontend/src/wakeup.js) never leaves the browser: Chrome
+// intercepts requests to the real Render address, records them and answers
+// itself. Every ping from every test profile is recorded with the page it came from.
+const RENDER_ORIGIN = 'https://automailzp.onrender.com';
+const renderPings = [];
+const cdpEventHandlers = new Map(); // sessionId -> fn(event)
 
 async function startHomeServer() {
   const homeData = path.join(tmp, 'home-data');
@@ -159,11 +170,14 @@ async function startHomeServer() {
   const outer = express();
   let inner = null;
   outer.use((req, res, next) => {
-    if (req.path.startsWith('/api/')) homeRequests.push({ method: req.method, path: req.path, at: Date.now() });
-    if (req.path === '/api/health' && homeFaults.healthFailures > 0) {
-      homeFaults.healthFailures -= 1;
+    const entry = { method: req.method, path: req.path, at: Date.now(), failed: false };
+    if (req.path.startsWith('/api/')) homeRequests.push(entry);
+    if (req.path === '/api/health' && (homeFaults.asleepUntilPing || homeFaults.healthFailures > 0)) {
+      if (!homeFaults.asleepUntilPing) homeFaults.healthFailures -= 1;
+      entry.failed = true;
       return res.status(502).send('<html>Bad gateway</html>');
     }
+    if (!req.path.startsWith('/api/')) res.setHeader('Content-Security-Policy', VERCEL_CSP); // as served by Vercel
     return inner(req, res, next);
   });
   outer.use(express.static(DIST));
@@ -223,6 +237,7 @@ async function startChrome() {
   });
   ws.addEventListener('message', (m) => {
     const d = JSON.parse(m.data);
+    if (d.method && d.sessionId) cdpEventHandlers.get(d.sessionId)?.(d);
     if (!d.id || !pending.has(d.id)) return;
     const p = pending.get(d.id);
     pending.delete(d.id);
@@ -241,6 +256,19 @@ async function openUser(base) {
   const { targetId } = await call('Target.createTarget', { url: 'about:blank', browserContextId: ctx });
   const { sessionId } = await call('Target.attachToTarget', { targetId, flatten: true });
   const cdp = (m, p) => call(m, p, sessionId);
+  cdpEventHandlers.set(sessionId, (e) => {
+    if (e.method !== 'Fetch.requestPaused') return;
+    const { requestId, request } = e.params;
+    renderPings.push({ from: base, url: request.url, method: request.method, headers: request.headers, hasBody: Boolean(request.postData || request.hasPostData), at: Date.now() });
+    // Like Render: a sleeping service holds the request open while it starts, then answers.
+    const asleep = homeFaults.asleepUntilPing;
+    setTimeout(() => {
+      homeFaults.asleepUntilPing = false;
+      const body = Buffer.from('{"ok":true,"data":{"ready":true}}').toString('base64');
+      cdp('Fetch.fulfillRequest', { requestId, responseCode: 200, responseHeaders: [{ name: 'Content-Type', value: 'application/json' }], body }).catch(() => {});
+    }, asleep ? 1500 : 0);
+  });
+  await cdp('Fetch.enable', { patterns: [{ urlPattern: `${RENDER_ORIGIN}/*` }] });
   await cdp('Emulation.setFocusEmulationEnabled', { enabled: true });
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
   await cdp('DOM.enable');
@@ -482,6 +510,7 @@ async function homepageColdStart(homeBase) {
   const shown = await u.waitFor(`document.querySelector('h1.login-title')?.textContent === 'Sign in' && document.querySelector('.signin-brand')?.textContent.includes('ZodiacPatent')`);
   await sleep(1200);
   check('H1. sign-in screen shows the ZodiacPatent brand and makes no backend request on load', shown && homeRequests.length === 0, homeRequests);
+  const pingsAtLoad = renderPings.length;
   const noScroll = (label) => u.js(`const d=document.documentElement; return { v: d.scrollHeight - d.clientHeight, h: d.scrollWidth - d.clientWidth, label: ${JSON.stringify(label)} }`);
   const desk = await noScroll('1400x900');
   check('H2. desktop: no scrolling', desk.v <= 0 && desk.h <= 0, desk);
@@ -535,6 +564,7 @@ async function homepageColdStart(homeBase) {
 
   // Reload: the workspace comes back without signing in again.
   homeRequests.length = 0;
+  const pingsBeforeReload = renderPings.length;
   await u.cdp('Page.reload');
   await sleep(300);
   const restored = await u.waitFor(`document.querySelectorAll('.tab').length === 5`, 10000);
@@ -549,6 +579,45 @@ async function homepageColdStart(homeBase) {
   await u.waitFor(`document.querySelector('.lp h1.login-title')`);
   await sleep(800);
   check('H13. after signing out, the homepage reloads with no backend request', homeRequests.length === 0 && (await u.js(`return localStorage.getItem('zp-signed-in')`)) === null, homeRequests);
+
+  const pingsAfterReloads = renderPings.length;
+
+  // Render asleep as in production: the proxied check keeps failing (502) until
+  // Render is pinged directly. The ping wakes it, the proxied check then
+  // succeeds, and only then is the login sent, exactly once.
+  homeRequests.length = 0;
+  const pingsBefore = renderPings.length;
+  homeFaults.asleepUntilPing = true;
+  await u.typeInto('#login-username', HOME_USER);
+  await u.typeInto('#login-password', HOME_PASSWORD);
+  await u.js(`const f=document.querySelector('.home-login form'); ${submitBtn}.click(); f.requestSubmit(); ${submitBtn}.click(); return true`);
+  const woke = await u.waitFor(`document.querySelectorAll('.tab').length === 5`, 30000);
+  const pings = renderPings.slice(pingsBefore);
+  const okHealth = health().filter((r) => !r.failed);
+  check(
+    'H15. sleeping Render (proxy 502 until pinged): one direct wake ping wakes it, then signed in',
+    woke && !homeFaults.asleepUntilPing && pings.length === 1 && pings[0].at <= okHealth[0]?.at && health()[0].failed && okHealth.length >= 1,
+    { woke, pings: pings.length, health: health().map((r) => (r.failed ? 502 : 200)) },
+  );
+  const headerNames = Object.keys(pings[0]?.headers || {}).map((k) => k.toLowerCase());
+  check(
+    'H16. the wake ping is a bare GET of the Render readiness check: no body, no cookie, no auth/CSRF/operator header',
+    pings.length === 1 && pings[0].url === `${RENDER_ORIGIN}/api/health` && pings[0].method === 'GET' && !pings[0].hasBody &&
+      !headerNames.some((h) => ['cookie', 'authorization', 'x-csrf-token', 'x-oea-request', 'x-operator', 'content-type'].includes(h)),
+    pings[0],
+  );
+  check(
+    'H17. with the ping, the login is still sent exactly once, after the proxied check succeeded; nothing but GET /api/health before it',
+    logins().length === 1 && logins()[0].at >= okHealth[0].at && homeRequests.filter((r) => r.at < logins()[0].at).every((r) => r.method === 'GET' && r.path === '/api/health'),
+    { logins: logins().length, requests: homeRequests.map((r) => `${r.method} ${r.path}${r.failed ? ' 502' : ''}`) },
+  );
+  check(
+    'H18. wake pings only on sign-in: none from local-install (localhost) pages, on page load, or on reloads',
+    renderPings.every((p) => p.from === homeBase) && pingsAtLoad === 0 && pingsAfterReloads === pingsBeforeReload && renderPings.length >= 3,
+    { from: [...new Set(renderPings.map((p) => p.from))], pingsAtLoad, duringReloads: pingsAfterReloads - pingsBeforeReload, total: renderPings.length },
+  );
+  await u.click('.session-info button', 'Sign out');
+  await u.waitFor(`document.querySelector('.lp h1.login-title')`);
 
   for (const [w, h, name] of [[1366, 768, 'laptop'], [1280, 720, 'small laptop'], [820, 1180, 'tablet'], [390, 844, 'phone'], [375, 667, 'small phone']]) {
     await u.cdp('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: w < 600 });
